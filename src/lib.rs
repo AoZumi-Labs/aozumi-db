@@ -25,7 +25,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 pub use auth::{mint as mint_token, Claims};
-pub use backup::{BackupConfig, BackupTarget};
+pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
 use backup::{BackupError, Backups};
 use proto::{PipelineReq, PipelineResp};
 use registry::{Registry, RegistryError};

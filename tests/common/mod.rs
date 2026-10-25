@@ -41,11 +41,11 @@ impl TestServer {
     }
 
     pub async fn with_backups(backups: &Backups) -> Self {
-        let backup = BackupConfig {
-            target: BackupTarget::directory(backups.dir.clone()),
-            keep: backups.keep,
-            every: backups.every,
-        };
+        Self::with_backup_target(BackupTarget::directory(backups.dir.clone()), backups.keep, backups.every).await
+    }
+
+    pub async fn with_backup_target(target: BackupTarget, keep: usize, every: Option<Duration>) -> Self {
+        let backup = BackupConfig { target, keep, every };
         Self::start(Some(SECRET), move |c| c.backup = Some(backup)).await
     }
 

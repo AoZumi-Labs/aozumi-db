@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, Claims, Config};
+use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
@@ -37,10 +37,38 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
         eprintln!("aozumi-db: AOZUMI_DB_SECRET is unset, running in dev mode: no auth, one database named `default`");
     }
 
+    let mut config = Config::new(data_dir.clone(), secret);
+    config.backup = backup_config()?;
+    if config.backup.is_none() {
+        eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");
+    }
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("aozumi-db: listening on http://{} (data in {})", listener.local_addr()?, data_dir.display());
     tokio::select! {
-        result = aozumi_db::serve(listener, Config::new(data_dir, secret)) => result,
+        result = aozumi_db::serve(listener, config) => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
+}
+
+/// `AOZUMI_DB_BACKUP_URL` turns backups on; `AOZUMI_DB_BACKUP_EVERY` (seconds,
+/// 0 = only on request) and `AOZUMI_DB_BACKUP_KEEP` tune them.
+fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
+    let Some(url) = std::env::var("AOZUMI_DB_BACKUP_URL").ok().filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    let number = |name: &str, default: u64| -> anyhow::Result<u64> {
+        match std::env::var(name) {
+            Ok(value) => value.parse().map_err(|_| anyhow::anyhow!("{name} must be a whole number, got {value:?}")),
+            Err(_) => Ok(default),
+        }
+    };
+    let every = number("AOZUMI_DB_BACKUP_EVERY", 300)?;
+    let keep = number("AOZUMI_DB_BACKUP_KEEP", 24)?;
+    eprintln!("aozumi-db: backing up to {url}, every {every}s when changed, keeping {keep} per database");
+    Ok(Some(BackupConfig {
+        target: BackupTarget::parse(&url)?,
+        keep: keep.max(1) as usize,
+        every: (every > 0).then(|| Duration::from_secs(every)),
+    }))
 }

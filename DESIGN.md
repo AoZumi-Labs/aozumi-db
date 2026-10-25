@@ -15,8 +15,8 @@ Status: experimental and pre-1.0.
 3. One Rust process that is small to read and to run, and that sits next to
    AOZUMI's Rust gateway without being part of it.
 
-Not goals for v0: replication, point-in-time restore, read-only tokens,
-protocol v3 (cursors, protobuf), `describe`.
+Not goals yet: replication, point-in-time restore between backups,
+read-only tokens, protocol v3 (cursors, protobuf), `describe`.
 
 ## Shape
 
@@ -44,6 +44,10 @@ aozumi-db (hyper + tokio)
 | D7 | Error codes use SQLite names (`SQLITE_CONSTRAINT`, ...) | `@libsql/client` passes them through as `LibsqlError.code`, which apps already check. |
 | D8 | Named arguments without a prefix match `:name`, `@name` or `$name` in the SQL | `@libsql/client` sends object keys without the prefix. |
 | D9 | No secret configured = dev mode: no auth, one database named `default` | Local development and tests need no setup. The server logs a warning. |
+| D10 | A backup copies the database and WAL files under `BEGIN IMMEDIATE`, then checkpoints the copy into one file | Writers wait only for a local file copy; readers never wait. The result is one self-contained file. Every connection gets a 5 s busy timeout so writes wait instead of failing. |
+| D11 | Scheduled backups skip databases whose files have not changed (size and mtime) | Idle apps cost nothing, including in backup storage and requests. |
+| D12 | Restores create a new database; they never overwrite a live one | No restore can destroy data. Restoring in place is delete, then create from backup, on purpose. |
+| D13 | Our own small S3 client (SigV4, IMDSv2) instead of the AWS SDK | We need four operations; the SDK is a large dependency for that. Signing is checked against AWS's published examples. |
 
 ## HTTP surface
 
@@ -69,8 +73,10 @@ Database names: `[a-z0-9][a-z0-9-]{0,62}`.
 
 ## Roadmap
 
-1. v0 (this): server, protocol v2, tokens, admin API, tests against the real client.
-2. Backups: ship WAL frames and snapshots to S3; restore to a point in time.
+1. Done: server, protocol v2, tokens, admin API, tests against the real client.
+2. Done: scheduled snapshots to S3 or a directory, retention, restore.
+   Next: ship WAL frames between snapshots for point-in-time restore;
+   stream large backups instead of holding them in memory; compression.
 3. AOZUMI integration as an experimental option: one database per app and
    preview, a `DATABASE_URL` + token injected as secrets, gateway route
    `db.aozumi.dev`.

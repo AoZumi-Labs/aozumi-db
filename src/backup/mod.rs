@@ -2,6 +2,8 @@
 //! (a directory or an S3-compatible bucket) under `<database>/<id>.db`.
 //! Ids are zero-padded unix milliseconds, so they sort by age.
 
+mod s3;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +12,9 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::registry::{Fingerprint, Registry, RegistryError};
+
+pub use s3::{Credentials, S3Options};
+use s3::S3;
 
 pub struct BackupConfig {
     pub target: BackupTarget,
@@ -23,6 +28,7 @@ pub struct BackupTarget(Store);
 
 enum Store {
     Directory(PathBuf),
+    S3(Box<S3>),
 }
 
 impl BackupTarget {
@@ -30,13 +36,25 @@ impl BackupTarget {
         Self(Store::Directory(path))
     }
 
-    /// `file:///absolute/path` or a plain path.
+    pub fn s3(options: S3Options) -> anyhow::Result<Self> {
+        Ok(Self(Store::S3(Box::new(S3::new(options)?))))
+    }
+
+    /// `s3://bucket/prefix` (credentials and region from the AWS environment
+    /// variables or the instance role), `file:///absolute/path`, or a path.
     pub fn parse(url: &str) -> anyhow::Result<Self> {
+        if url.starts_with("s3://") {
+            return Self::s3(S3Options::from_url(url)?);
+        }
         match url.strip_prefix("file://") {
             Some(path) => Ok(Self::directory(PathBuf::from(path))),
             None if url.contains("://") => anyhow::bail!("unsupported backup URL {url:?}"),
             None => Ok(Self::directory(PathBuf::from(url))),
         }
+    }
+
+    fn key(db: &str, id: &str) -> String {
+        format!("{db}/{id}.db")
     }
 
     async fn put(&self, db: &str, id: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -49,6 +67,7 @@ impl BackupTarget {
                 tokio::fs::rename(&partial, dir.join(format!("{id}.db"))).await?;
                 Ok(())
             }
+            Store::S3(s3) => s3.put(&Self::key(db, id), bytes).await,
         }
     }
 
@@ -59,6 +78,7 @@ impl BackupTarget {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(err) => Err(err.into()),
             },
+            Store::S3(s3) => s3.get(&Self::key(db, id)).await,
         }
     }
 
@@ -79,6 +99,15 @@ impl BackupTarget {
                     }
                 }
             }
+            Store::S3(s3) => {
+                let dir = format!("{db}/");
+                for (key, size_bytes) in s3.list(&dir).await? {
+                    let id = key.strip_prefix(&dir).and_then(|name| name.strip_suffix(".db"));
+                    if let Some(id) = id.filter(|id| valid_id(id)) {
+                        out.push(BackupInfo { id: id.to_string(), size_bytes });
+                    }
+                }
+            }
         }
         out.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(out)
@@ -90,6 +119,7 @@ impl BackupTarget {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
                 _ => Ok(()),
             },
+            Store::S3(s3) => s3.delete(&Self::key(db, id)).await,
         }
     }
 }

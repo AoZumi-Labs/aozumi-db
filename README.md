@@ -5,7 +5,7 @@ database server written in Rust. It speaks libSQL's HTTP protocol, so the
 libSQL clients you already use work without changes.
 
 > **Experimental.** aozumi-db is pre-1.0 and has no replication yet. Turn on
-> backups and keep your own copy of anything you care about.
+> backups.
 
 ## Why
 
@@ -57,6 +57,36 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `AOZUMI_DB_LISTEN` | `127.0.0.1:8080` | Listen address |
 | `AOZUMI_DB_DATA_DIR` | `./data` | Where database files live |
 | `AOZUMI_DB_SECRET` | unset (dev mode) | Signs tokens; also the admin API credential |
+| `AOZUMI_DB_BACKUP_URL` | unset (no backups) | `s3://bucket/prefix` or `file:///path` |
+| `AOZUMI_DB_BACKUP_EVERY` | `300` | Seconds between backups of changed databases; `0` = only on request |
+| `AOZUMI_DB_BACKUP_KEEP` | `24` | Backups kept per database |
+| `AOZUMI_DB_S3_ENDPOINT` | AWS S3 | An S3-compatible endpoint, e.g. Cloudflare R2 or MinIO |
+
+## Backups
+
+With `AOZUMI_DB_BACKUP_URL` set, every database that changed is backed up on
+a schedule, and the oldest backups past `AOZUMI_DB_BACKUP_KEEP` are deleted.
+A backup is a consistent copy of the whole database as one file. Writes keep
+working while it is taken: they wait for the local file copy instead of failing.
+
+For S3, credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+(and `AWS_SESSION_TOKEN`), or from the EC2 instance role when those are unset.
+The region comes from `AWS_REGION`.
+
+```bash
+# take one now
+curl -X POST localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET"
+
+# list them, newest first
+curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET"
+
+# restore into a new database (or under the old name, once it is gone)
+curl -X POST localhost:8080/v1/databases -H "authorization: Bearer $AOZUMI_DB_SECRET" \
+  -d '{"name": "notes-restored", "restore": {"database": "notes", "backup": "latest"}}'
+```
+
+Restores never overwrite a live database. A new machine pointed at the same
+backup store can restore every database it finds there.
 
 ## API
 
@@ -66,9 +96,11 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `GET` | `/v2` | none | protocol version check |
 | `GET` | `/health` | none | liveness |
 | `GET` | `/v1/databases` | admin | list databases |
-| `POST` | `/v1/databases` | admin | create `{"name": "..."}` |
+| `POST` | `/v1/databases` | admin | create `{"name": "..."}`, optionally `"restore": {"database", "backup"}` |
 | `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files |
 | `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N}` → `{"token": "..."}` |
+| `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes"}` |
+| `GET` | `/v1/databases/{name}/backups` | admin | list backups, newest first |
 
 Supported pipeline requests: `execute`, `batch` (with conditions), `sequence`,
 `store_sql`, `close_sql`, `get_autocommit`, `close`. Interactive
