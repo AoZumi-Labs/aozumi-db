@@ -145,6 +145,11 @@ impl Streams {
         (at.elapsed() < self.idle).then_some(stream)
     }
 
+    /// Drop every parked stream of a database that is being deleted.
+    pub async fn close_database(&self, db: &str) {
+        self.parked.lock().await.retain(|_, (stream, _)| stream.db != db);
+    }
+
     /// Park a stream and return the baton for the next request.
     pub async fn park(&self, stream: Stream) -> String {
         let mut bytes = [0u8; 24];

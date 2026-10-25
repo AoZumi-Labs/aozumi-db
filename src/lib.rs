@@ -1,6 +1,7 @@
 //! aozumi-db: a database per app, served over libSQL's HTTP protocol.
 //! See DESIGN.md for the decisions behind this file.
 
+mod auth;
 mod exec;
 mod proto;
 mod registry;
@@ -9,7 +10,7 @@ mod stream;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -18,10 +19,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde::Deserialize;
+use serde_json::json;
 use tokio::net::TcpListener;
 
+pub use auth::{mint as mint_token, Claims};
 use proto::{PipelineReq, PipelineResp};
-use registry::Registry;
+use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -42,12 +46,14 @@ impl Config {
 }
 
 struct State {
+    secret: Option<Vec<u8>>,
     registry: Registry,
     streams: Arc<Streams>,
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
+        secret: config.secret,
         registry: Registry::new(config.data_dir),
         streams: Streams::new(config.stream_idle_timeout),
     });
@@ -68,33 +74,51 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
 type Resp = Response<Full<Bytes>>;
 
 async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/health") => json(StatusCode::OK, &"ok"),
-        (&Method::GET, "/v2") => json(StatusCode::OK, &serde_json::json!({})),
-        (&Method::POST, "/v2/pipeline") => pipeline(&state, req).await,
+    let path = req.uri().path().to_string();
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match (req.method(), segments.as_slice()) {
+        (&Method::GET, ["health"]) => json(StatusCode::OK, &"ok"),
+        (&Method::GET, ["v2"]) => json(StatusCode::OK, &json!({})),
+        (&Method::POST, ["v2", "pipeline"]) => pipeline(&state, req).await,
+        (_, ["v1", "databases", ..]) => {
+            if !is_admin(&state, &req) {
+                return text(StatusCode::UNAUTHORIZED, "admin credentials required");
+            }
+            match (req.method(), &segments[2..]) {
+                (&Method::GET, []) => list_databases(&state).await,
+                (&Method::POST, []) => create_database(&state, req).await,
+                (&Method::DELETE, [name]) => delete_database(&state, name).await,
+                (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
+                _ => text(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
         _ => text(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
 async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
-    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
-    };
-    let msg: PipelineReq = match serde_json::from_slice(&body) {
-        Ok(msg) => msg,
-        Err(err) => return text(StatusCode::BAD_REQUEST, &format!("invalid pipeline request: {err}")),
+    // Dev mode serves one database to anyone; otherwise the token names it.
+    let (database, create) = match &state.secret {
+        None => (DEV_DATABASE.to_string(), true),
+        Some(secret) => match bearer(&req).and_then(|t| auth::verify(secret, t, unix_now())) {
+            Some(claims) => (claims.db, false),
+            None => return text(StatusCode::UNAUTHORIZED, "a valid database token is required"),
+        },
     };
 
-    let database = DEV_DATABASE;
+    let msg: PipelineReq = match read_json(req).await {
+        Ok(msg) => msg,
+        Err(resp) => return resp,
+    };
+
     let mut stream = match &msg.baton {
         Some(baton) => match state.streams.take(baton).await {
             Some(stream) if stream.db == database => stream,
             _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
         },
-        None => match open_stream(state, database).await {
+        None => match open_stream(state, &database, create).await {
             Ok(stream) => stream,
-            Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot open database: {err}")),
+            Err(resp) => return resp,
         },
     };
 
@@ -110,9 +134,99 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
 
-async fn open_stream(state: &State, database: &str) -> anyhow::Result<Stream> {
-    let conn = state.registry.open(database).await?.connect()?;
+async fn open_stream(state: &State, database: &str, create: bool) -> Result<Stream, Resp> {
+    let db = state.registry.open(database, create).await.map_err(registry_error)?;
+    let conn = db
+        .connect()
+        .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     Ok(Stream::new(database.to_string(), conn))
+}
+
+async fn list_databases(state: &State) -> Resp {
+    match state.registry.list().await {
+        Ok(names) => {
+            let databases = names.into_iter().map(|name| json!({"name": name})).collect::<Vec<_>>();
+            json(StatusCode::OK, &json!({"databases": databases}))
+        }
+        Err(err) => registry_error(err),
+    }
+}
+
+async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
+    #[derive(Deserialize)]
+    struct Body {
+        name: String,
+    }
+    let body: Body = match read_json(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    match state.registry.create(&body.name).await {
+        Ok(()) => json(StatusCode::CREATED, &json!({"name": body.name})),
+        Err(err) => registry_error(err),
+    }
+}
+
+async fn delete_database(state: &State, name: &str) -> Resp {
+    match state.registry.delete(name).await {
+        Ok(()) => {
+            state.streams.close_database(name).await;
+            Response::builder().status(StatusCode::NO_CONTENT).body(Full::default()).unwrap()
+        }
+        Err(err) => registry_error(err),
+    }
+}
+
+async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+    #[derive(Deserialize)]
+    struct Body {
+        ttl_seconds: Option<u64>,
+    }
+    let Some(secret) = &state.secret else {
+        return text(StatusCode::BAD_REQUEST, "tokens need a secret; dev mode has none");
+    };
+    let body: Body = match read_json(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    if let Err(err) = state.registry.open(name, false).await {
+        return registry_error(err);
+    }
+    let claims = Claims { db: name.to_string(), exp: body.ttl_seconds.map(|ttl| unix_now() + ttl) };
+    json(StatusCode::OK, &json!({"token": auth::mint(secret, &claims)}))
+}
+
+fn is_admin(state: &State, req: &Request<Incoming>) -> bool {
+    match &state.secret {
+        None => true,
+        Some(secret) => bearer(req).is_some_and(|t| auth::is_admin(secret, t)),
+    }
+}
+
+fn bearer(req: &Request<Incoming>) -> Option<&str> {
+    req.headers().get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, Resp> {
+    let body = Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?
+        .to_bytes();
+    serde_json::from_slice(&body).map_err(|err| text(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {err}")))
+}
+
+fn registry_error(err: RegistryError) -> Resp {
+    match err {
+        RegistryError::InvalidName => text(StatusCode::BAD_REQUEST, "database names match [a-z0-9][a-z0-9-]{0,62}"),
+        RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
+        RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
+        RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),
+    }
 }
 
 fn json<T: serde::Serialize>(status: StatusCode, body: &T) -> Resp {
