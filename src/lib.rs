@@ -2,6 +2,7 @@
 //! See DESIGN.md for the decisions behind this file.
 
 mod auth;
+mod backup;
 mod exec;
 mod proto;
 mod registry;
@@ -24,12 +25,16 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 pub use auth::{mint as mint_token, Claims};
+pub use backup::{BackupConfig, BackupTarget};
+use backup::{BackupError, Backups};
 use proto::{PipelineReq, PipelineResp};
 use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const DEV_DATABASE: &str = "default";
+/// How long a statement waits for another writer (or a backup) to finish.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -37,11 +42,12 @@ pub struct Config {
     pub secret: Option<Vec<u8>>,
     /// How long a stream may sit unused before it is closed.
     pub stream_idle_timeout: Duration,
+    pub backup: Option<BackupConfig>,
 }
 
 impl Config {
     pub fn new(data_dir: PathBuf, secret: Option<Vec<u8>>) -> Self {
-        Self { data_dir, secret, stream_idle_timeout: Duration::from_secs(10) }
+        Self { data_dir, secret, stream_idle_timeout: Duration::from_secs(10), backup: None }
     }
 }
 
@@ -49,6 +55,7 @@ struct State {
     secret: Option<Vec<u8>>,
     registry: Registry,
     streams: Arc<Streams>,
+    backups: Backups,
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
@@ -56,7 +63,19 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
         secret: config.secret,
         registry: Registry::new(config.data_dir),
         streams: Streams::new(config.stream_idle_timeout),
+        backups: Backups::new(config.backup),
     });
+    if let Some(every) = state.backups.every() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.run_scheduled(&state.registry).await;
+            }
+        });
+    }
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
@@ -89,6 +108,14 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                 (&Method::POST, []) => create_database(&state, req).await,
                 (&Method::DELETE, [name]) => delete_database(&state, name).await,
                 (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
+                (&Method::POST, [name, "backups"]) => match state.backups.snapshot(&state.registry, name).await {
+                    Ok(info) => json(StatusCode::CREATED, &info),
+                    Err(err) => backup_error(err),
+                },
+                (&Method::GET, [name, "backups"]) => match state.backups.list(name).await {
+                    Ok(backups) => json(StatusCode::OK, &json!({"backups": backups})),
+                    Err(err) => backup_error(err),
+                },
                 _ => text(StatusCode::NOT_FOUND, "not found"),
             }
         }
@@ -138,6 +165,7 @@ async fn open_stream(state: &State, database: &str, create: bool) -> Result<Stre
     let db = state.registry.open(database, create).await.map_err(registry_error)?;
     let conn = db
         .connect()
+        .and_then(|conn| conn.busy_timeout(BUSY_TIMEOUT).map(|_| conn))
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     Ok(Stream::new(database.to_string(), conn))
 }
@@ -156,12 +184,34 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
     #[derive(Deserialize)]
     struct Body {
         name: String,
+        /// Start from a backup instead of empty.
+        restore: Option<Restore>,
+    }
+    #[derive(Deserialize)]
+    struct Restore {
+        database: String,
+        backup: String,
     }
     let body: Body = match read_json(req).await {
         Ok(body) => body,
         Err(resp) => return resp,
     };
-    match state.registry.create(&body.name).await {
+    let created = match body.restore {
+        None => state.registry.create(&body.name).await,
+        Some(from) => {
+            // Refuse early so a doomed restore does not download a backup.
+            match state.registry.open(&body.name, false).await {
+                Ok(_) => return registry_error(RegistryError::Exists),
+                Err(RegistryError::NotFound) => {}
+                Err(err) => return registry_error(err),
+            }
+            match state.backups.fetch(&from.database, &from.backup).await {
+                Ok(bytes) => state.registry.create_from(&body.name, bytes).await,
+                Err(err) => return backup_error(err),
+            }
+        }
+    };
+    match created {
         Ok(()) => json(StatusCode::CREATED, &json!({"name": body.name})),
         Err(err) => registry_error(err),
     }
@@ -226,6 +276,16 @@ fn registry_error(err: RegistryError) -> Resp {
         RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
         RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
         RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),
+    }
+}
+
+fn backup_error(err: BackupError) -> Resp {
+    match err {
+        BackupError::NotConfigured => text(StatusCode::BAD_REQUEST, "backups are not configured on this server"),
+        BackupError::NotFound => text(StatusCode::NOT_FOUND, "backup not found"),
+        BackupError::InvalidId => text(StatusCode::BAD_REQUEST, "backup ids are digits, or `latest`"),
+        BackupError::Registry(err) => registry_error(err),
+        BackupError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("backup error: {err}")),
     }
 }
 

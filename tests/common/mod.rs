@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use aozumi_db::Config;
+use aozumi_db::{BackupConfig, BackupTarget, Config};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode};
@@ -19,26 +19,40 @@ pub struct TestServer {
     pub dir: TempDir,
 }
 
+/// Backups go to a plain directory, so tests can also look at what was written.
+pub struct Backups {
+    pub dir: std::path::PathBuf,
+    pub keep: usize,
+    pub every: Option<Duration>,
+}
+
 impl TestServer {
     /// Dev mode: no secret, one database named `default`.
     pub async fn dev() -> Self {
-        Self::start(None, None).await
+        Self::start(None, |_| {}).await
     }
 
     pub async fn dev_with_idle_timeout(idle: Duration) -> Self {
-        Self::start(None, Some(idle)).await
+        Self::start(None, |c| c.stream_idle_timeout = idle).await
     }
 
     pub async fn with_secret() -> Self {
-        Self::start(Some(SECRET), None).await
+        Self::start(Some(SECRET), |_| {}).await
     }
 
-    async fn start(secret: Option<&str>, idle: Option<Duration>) -> Self {
+    pub async fn with_backups(backups: &Backups) -> Self {
+        let backup = BackupConfig {
+            target: BackupTarget::directory(backups.dir.clone()),
+            keep: backups.keep,
+            every: backups.every,
+        };
+        Self::start(Some(SECRET), move |c| c.backup = Some(backup)).await
+    }
+
+    async fn start(secret: Option<&str>, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::new(dir.path().to_path_buf(), secret.map(|s| s.as_bytes().to_vec()));
-        if let Some(idle) = idle {
-            config.stream_idle_timeout = idle;
-        }
+        tweak(&mut config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });
@@ -68,6 +82,23 @@ impl TestServer {
         (status, value)
     }
 
+    pub async fn admin(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        self.request(method, path, Some(SECRET), body).await
+    }
+
+    /// Create a database and return a token for it.
+    pub async fn database(&self, name: &str) -> String {
+        let (status, body) = self.admin(Method::POST, "/v1/databases", Some(json!({"name": name}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        self.token(name).await
+    }
+
+    pub async fn token(&self, name: &str) -> String {
+        let (status, body) = self.admin(Method::POST, &format!("/v1/databases/{name}/tokens"), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["token"].as_str().unwrap().to_string()
+    }
+
     pub async fn pipeline(&self, token: Option<&str>, body: Value) -> (StatusCode, Value) {
         self.request(Method::POST, "/v2/pipeline", token, Some(body)).await
     }
@@ -88,4 +119,9 @@ pub fn execute(sql: &str) -> Value {
 
 pub fn execute_args(sql: &str, args: Value) -> Value {
     json!({"type": "execute", "stmt": {"sql": sql, "args": args, "want_rows": true}})
+}
+
+/// The single value of a one-row, one-column result.
+pub fn scalar(results: &[Value]) -> Value {
+    results[0]["response"]["result"]["rows"][0][0]["value"].clone()
 }
