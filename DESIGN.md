@@ -5,7 +5,7 @@ Rust. Each app gets its own database file on the server's disk. Apps reach it
 over HTTP with the libSQL protocol (Hrana over HTTP, version 2), so
 `@libsql/client`, Drizzle and other libSQL clients work without changes.
 
-Status: experimental. The engine is pre-1.0, so keep independent backups.
+Status: experimental and pre-1.0.
 
 ## Goals
 

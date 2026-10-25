@@ -4,8 +4,8 @@ A database for every app, as a file. aozumi-db is a SQLite-compatible
 database server written in Rust. It speaks libSQL's HTTP protocol, so the
 libSQL clients you already use work without changes.
 
-> **Experimental.** The storage engine is pre-1.0, and this server has no
-> backups or replication yet. Keep your own copy of anything you care about.
+> **Experimental.** aozumi-db is pre-1.0 and has no replication yet. Turn on
+> backups and keep your own copy of anything you care about.
 
 ## Why
 
