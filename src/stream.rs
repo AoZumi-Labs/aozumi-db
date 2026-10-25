@@ -9,22 +9,21 @@ use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use tokio::sync::Mutex;
-use turso::Connection;
 
-use crate::exec::{self, sql_error};
+use crate::engine::Conn;
 use crate::proto::{
     BatchCond, BatchResult, Error, Stmt, StmtResult, StreamRequest, StreamResponse, StreamResult,
 };
 
 pub struct Stream {
     pub db: String,
-    conn: Connection,
+    conn: Conn,
     sqls: HashMap<i32, String>,
     closed: bool,
 }
 
 impl Stream {
-    pub fn new(db: String, conn: Connection) -> Self {
+    pub fn new(db: String, conn: Conn) -> Self {
         Self { db, conn, sqls: HashMap::new(), closed: false }
     }
 
@@ -32,11 +31,12 @@ impl Stream {
         self.closed
     }
 
-    pub async fn handle(&mut self, request: &StreamRequest) -> StreamResult {
+    /// Blocks: call from the blocking pool.
+    pub fn handle(&mut self, request: &StreamRequest) -> StreamResult {
         let outcome = if self.closed {
             Err(Error::new("the stream is closed", "STREAM_CLOSED"))
         } else {
-            self.run(request).await
+            self.run(request)
         };
         match outcome {
             Ok(response) => StreamResult::Ok { response },
@@ -44,20 +44,20 @@ impl Stream {
         }
     }
 
-    async fn run(&mut self, request: &StreamRequest) -> Result<StreamResponse, Error> {
+    fn run(&mut self, request: &StreamRequest) -> Result<StreamResponse, Error> {
         Ok(match request {
             StreamRequest::Close => {
                 self.closed = true;
                 StreamResponse::Close
             }
-            StreamRequest::Execute { stmt } => StreamResponse::Execute { result: self.execute(stmt).await? },
+            StreamRequest::Execute { stmt } => StreamResponse::Execute { result: self.execute(stmt)? },
             StreamRequest::Batch { batch } => {
                 let mut result = BatchResult { step_results: Vec::new(), step_errors: Vec::new() };
                 for step in &batch.steps {
                     let run = step.condition.as_ref().is_none_or(|c| self.holds(c, &result));
                     let (ok, err) = match run {
                         false => (None, None),
-                        true => match self.execute(&step.stmt).await {
+                        true => match self.execute(&step.stmt) {
                             Ok(r) => (Some(r), None),
                             Err(e) => (None, Some(e)),
                         },
@@ -69,7 +69,7 @@ impl Stream {
             }
             StreamRequest::Sequence { sql, sql_id } => {
                 let sql = self.sql(sql.as_deref(), *sql_id)?;
-                self.conn.execute_batch(&sql).await.map_err(sql_error)?;
+                self.conn.execute_script(&sql)?;
                 StreamResponse::Sequence
             }
             StreamRequest::StoreSql { sql_id, sql } => {
@@ -84,9 +84,10 @@ impl Stream {
         })
     }
 
-    async fn execute(&self, stmt: &Stmt) -> Result<StmtResult, Error> {
+    fn execute(&self, stmt: &Stmt) -> Result<StmtResult, Error> {
         let sql = self.sql(stmt.sql.as_deref(), stmt.sql_id)?;
-        exec::execute(&self.conn, &sql, stmt).await
+        let named = stmt.named_args.iter().map(|a| (a.name.clone(), a.value.clone())).collect::<Vec<_>>();
+        self.conn.execute(&sql, &stmt.args, &named, stmt.want_rows.unwrap_or(true))
     }
 
     fn sql(&self, sql: Option<&str>, sql_id: Option<i32>) -> Result<String, Error> {
@@ -113,7 +114,7 @@ impl Stream {
     }
 
     fn autocommit(&self) -> bool {
-        self.conn.is_autocommit().unwrap_or(true)
+        self.conn.autocommit()
     }
 }
 

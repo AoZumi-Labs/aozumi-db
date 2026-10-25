@@ -22,7 +22,9 @@ serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-turso = "0.8.3"
+# The storage engine's core API, pinned exactly: we drive its WAL directly.
+turso_core = { version = "=0.8.3", features = ["conn_raw_api"] }
+turso_parser = "=0.8.3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,7 +3,7 @@
 
 mod auth;
 mod backup;
-mod exec;
+mod engine;
 mod proto;
 mod registry;
 mod stream;
@@ -149,10 +149,16 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         },
     };
 
-    let mut results = Vec::with_capacity(msg.requests.len());
-    for request in &msg.requests {
-        results.push(stream.handle(request).await);
-    }
+    // Statements block on disk and CPU, so they run on the blocking pool.
+    let (stream, results) = match tokio::task::spawn_blocking(move || {
+        let results = msg.requests.iter().map(|request| stream.handle(request)).collect::<Vec<_>>();
+        (stream, results)
+    })
+    .await
+    {
+        Ok(done) => done,
+        Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")),
+    };
 
     let baton = match stream.is_closed() {
         true => None,
@@ -163,9 +169,8 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
 
 async fn open_stream(state: &State, database: &str, create: bool) -> Result<Stream, Resp> {
     let db = state.registry.open(database, create).await.map_err(registry_error)?;
-    let conn = db
-        .connect()
-        .and_then(|conn| conn.busy_timeout(BUSY_TIMEOUT).map(|_| conn))
+    let options = engine::ConnOptions { busy_timeout: BUSY_TIMEOUT };
+    let conn = engine::Conn::open(&db, &options)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     Ok(Stream::new(database.to_string(), conn))
 }

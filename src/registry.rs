@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::Mutex;
+use turso_core::CheckpointMode;
+
+use crate::engine::{self, Conn, ConnOptions, Db};
+use crate::proto::Value;
 
 /// How long a snapshot waits for in-flight writes before giving up.
 const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -16,7 +20,7 @@ pub struct Fingerprint(Vec<(u64, SystemTime)>);
 
 pub struct Registry {
     dir: PathBuf,
-    open: Mutex<HashMap<String, turso::Database>>,
+    open: Mutex<HashMap<String, Db>>,
 }
 
 #[derive(Debug)]
@@ -48,7 +52,7 @@ impl Registry {
 
     /// Open an existing database. With `create`, a missing one is created
     /// (dev mode only; otherwise databases are created through `create`).
-    pub async fn open(&self, name: &str, create: bool) -> Result<turso::Database, RegistryError> {
+    pub async fn open(&self, name: &str, create: bool) -> Result<Db, RegistryError> {
         if !valid_name(name) {
             return Err(RegistryError::InvalidName);
         }
@@ -74,7 +78,7 @@ impl Registry {
         }
         let db = self.build(name).await?;
         // The engine creates the file lazily; a first statement makes it real.
-        db.connect()?.execute("PRAGMA user_version = 0", ()).await?;
+        Conn::open(&db, &ConnOptions::default())?.execute_script("PRAGMA user_version = 0")?;
         open.insert(name.to_string(), db);
         Ok(())
     }
@@ -137,11 +141,9 @@ impl Registry {
         tokio::fs::rename(&partial, self.path(name)).await?;
         let checked = async {
             let db = self.build(name).await?;
-            let mut rows = db.connect()?.query("PRAGMA quick_check", ()).await?;
-            let verdict = rows.next().await?.map(|row| row.get_value(0)).transpose()?;
-            drop(rows);
-            match verdict {
-                Some(turso::Value::Text(ok)) if ok == "ok" => Ok(db),
+            let check = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA quick_check", &[], &[], true)?;
+            match check.rows.first().and_then(|row| row.first()) {
+                Some(Value::Text(ok)) if ok == "ok" => Ok(db),
                 other => anyhow::bail!("the backup is not a valid database: {other:?}"),
             }
         }
@@ -164,34 +166,8 @@ impl Registry {
         let db = self.open(name, false).await?;
         let scratch = self.dir.join(".tmp").join(format!("{name}-{}", rand::random::<u64>()));
         tokio::fs::create_dir_all(&scratch).await?;
-        let result = async {
-            let file = format!("{name}.db");
-            let conn = db.connect()?;
-            conn.busy_timeout(SNAPSHOT_LOCK_WAIT)?;
-            conn.execute("BEGIN IMMEDIATE", ()).await?;
-            let copied = async {
-                for suffix in ["", "-wal"] {
-                    let from = self.dir.join(format!("{file}{suffix}"));
-                    if tokio::fs::try_exists(&from).await? {
-                        tokio::fs::copy(&from, scratch.join(format!("{file}{suffix}"))).await?;
-                    }
-                }
-                anyhow::Ok(())
-            }
-            .await;
-            conn.execute("ROLLBACK", ()).await?;
-            copied?;
-
-            // Fold the copied WAL into the copy so the backup is one file.
-            let copy = scratch.join(&file);
-            let snapshot = turso::Builder::new_local(copy.to_str().unwrap()).build().await?;
-            let mut rows = snapshot.connect()?.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
-            while rows.next().await?.is_some() {}
-            drop(rows);
-            drop(snapshot);
-            Ok::<_, anyhow::Error>(tokio::fs::read(&copy).await?)
-        }
-        .await;
+        let (dir, file, work) = (self.dir.clone(), format!("{name}.db"), scratch.clone());
+        let result = tokio::task::spawn_blocking(move || snapshot_files(&db, &dir, &file, &work)).await?;
         let _ = tokio::fs::remove_dir_all(&scratch).await;
         Ok(result?)
     }
@@ -210,13 +186,36 @@ impl Registry {
         Ok(Fingerprint(parts))
     }
 
-    async fn build(&self, name: &str) -> anyhow::Result<turso::Database> {
+    async fn build(&self, name: &str) -> anyhow::Result<Db> {
         tokio::fs::create_dir_all(&self.dir).await?;
-        let path = self.path(name);
-        Ok(turso::Builder::new_local(path.to_str().unwrap()).build().await?)
+        Ok(engine::open(&self.path(name))?)
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.db"))
     }
+}
+
+/// Copy a database's files while holding its write lock, then fold the
+/// copied WAL into the copied database file and return that file. Blocks.
+fn snapshot_files(db: &Db, dir: &std::path::Path, file: &str, work: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let conn = Conn::open(db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT })?;
+    conn.execute_script("BEGIN IMMEDIATE")?;
+    let copied = (|| {
+        for suffix in ["", "-wal"] {
+            let from = dir.join(format!("{file}{suffix}"));
+            if from.exists() {
+                std::fs::copy(&from, work.join(format!("{file}{suffix}")))?;
+            }
+        }
+        anyhow::Ok(())
+    })();
+    conn.execute_script("ROLLBACK")?;
+    copied?;
+
+    let copy = work.join(file);
+    let snapshot = engine::open(&copy)?;
+    snapshot.connect()?.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
+    drop(snapshot);
+    Ok(std::fs::read(&copy)?)
 }

@@ -123,10 +123,24 @@ impl Error {
     }
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// A SQL value. Integers travel as decimal strings so 64-bit values survive
 /// JavaScript's number type; blobs travel as base64.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Value(pub turso::Value);
+pub enum Value {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -140,12 +154,12 @@ enum Wire {
 
 impl Serialize for Value {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let wire = match &self.0 {
-            turso::Value::Null => Wire::Null,
-            turso::Value::Integer(i) => Wire::Integer { value: i.to_string() },
-            turso::Value::Real(f) => Wire::Float { value: *f },
-            turso::Value::Text(t) => Wire::Text { value: t.clone() },
-            turso::Value::Blob(b) => Wire::Blob { base64: BASE64.encode(b) },
+        let wire = match self {
+            Value::Null => Wire::Null,
+            Value::Integer(i) => Wire::Integer { value: i.to_string() },
+            Value::Float(f) => Wire::Float { value: *f },
+            Value::Text(t) => Wire::Text { value: t.clone() },
+            Value::Blob(b) => Wire::Blob { base64: BASE64.encode(b) },
         };
         wire.serialize(s)
     }
@@ -153,12 +167,12 @@ impl Serialize for Value {
 
 impl<'de> Deserialize<'de> for Value {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Value(match Wire::deserialize(d)? {
-            Wire::Null => turso::Value::Null,
-            Wire::Integer { value } => turso::Value::Integer(value.parse().map_err(D::Error::custom)?),
-            Wire::Float { value } => turso::Value::Real(value),
-            Wire::Text { value } => turso::Value::Text(value),
-            Wire::Blob { base64 } => turso::Value::Blob(BASE64.decode(base64).map_err(D::Error::custom)?),
-        }))
+        Ok(match Wire::deserialize(d)? {
+            Wire::Null => Value::Null,
+            Wire::Integer { value } => Value::Integer(value.parse().map_err(D::Error::custom)?),
+            Wire::Float { value } => Value::Float(value),
+            Wire::Text { value } => Value::Text(value),
+            Wire::Blob { base64 } => Value::Blob(BASE64.decode(base64).map_err(D::Error::custom)?),
+        })
     }
 }
