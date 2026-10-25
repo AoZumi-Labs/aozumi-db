@@ -199,7 +199,7 @@ impl Registry {
 /// Copy a database's files while holding its write lock, then fold the
 /// copied WAL into the copied database file and return that file. Blocks.
 fn snapshot_files(db: &Db, dir: &std::path::Path, file: &str, work: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    let conn = Conn::open(db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT })?;
+    let conn = Conn::open(db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT, ..Default::default() })?;
     conn.execute_script("BEGIN IMMEDIATE")?;
     let copied = (|| {
         for suffix in ["", "-wal"] {

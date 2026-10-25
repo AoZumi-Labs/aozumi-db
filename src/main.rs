@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(ttl) => Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + ttl.parse::<u64>()?),
                 None => None,
             };
-            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), exp }));
+            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), exp, read_only: false }));
             Ok(())
         }
         _ => {

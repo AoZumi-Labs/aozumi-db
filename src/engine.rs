@@ -24,17 +24,21 @@ pub fn open(path: &Path) -> Result<Db, LimboError> {
 pub struct ConnOptions {
     /// How long a statement waits for another writer before failing.
     pub busy_timeout: Duration,
+    /// The engine refuses every write on this connection.
+    pub read_only: bool,
 }
 
 pub struct Conn {
     inner: Arc<turso_core::Connection>,
+    read_only: bool,
 }
 
 impl Conn {
     pub fn open(db: &Db, options: &ConnOptions) -> Result<Self, LimboError> {
         let inner = db.connect()?;
         inner.set_busy_timeout(options.busy_timeout);
-        Ok(Self { inner })
+        inner.set_query_only(options.read_only);
+        Ok(Self { inner, read_only: options.read_only })
     }
 
     pub fn autocommit(&self) -> bool {
@@ -49,7 +53,7 @@ impl Conn {
         named: &[(String, Value)],
         want_rows: bool,
     ) -> Result<StmtResult, Error> {
-        let mut stmt = self.inner.prepare(sql).map_err(sql_error)?;
+        let mut stmt = self.inner.prepare(sql).map_err(|err| self.error(err))?;
         if !positional.is_empty() && !named.is_empty() {
             return Err(Error::new("mixing positional and named arguments is not supported", "ARGS_INVALID"));
         }
@@ -85,7 +89,18 @@ impl Conn {
 
     /// Run every statement in `sql`, ignoring rows.
     pub fn execute_script(&self, sql: &str) -> Result<(), Error> {
-        self.inner.execute(sql).map_err(sql_error)
+        self.inner.execute(sql).map_err(|err| self.error(err))
+    }
+
+    fn error(&self, err: LimboError) -> Error {
+        // The engine reports a write on a query-only connection as a parse
+        // error; clients expect SQLite's READONLY code.
+        match &err {
+            LimboError::ParseError(message) if self.read_only && message.contains("query_only") => {
+                Error::new("this token is read-only", "SQLITE_READONLY")
+            }
+            _ => sql_error(err),
+        }
     }
 }
 

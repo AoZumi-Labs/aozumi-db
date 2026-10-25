@@ -11,20 +11,22 @@ use rand::RngCore;
 use tokio::sync::Mutex;
 
 use crate::engine::Conn;
+use crate::policy;
 use crate::proto::{
     BatchCond, BatchResult, Error, Stmt, StmtResult, StreamRequest, StreamResponse, StreamResult,
 };
 
 pub struct Stream {
     pub db: String,
+    pub read_only: bool,
     conn: Conn,
     sqls: HashMap<i32, String>,
     closed: bool,
 }
 
 impl Stream {
-    pub fn new(db: String, conn: Conn) -> Self {
-        Self { db, conn, sqls: HashMap::new(), closed: false }
+    pub fn new(db: String, read_only: bool, conn: Conn) -> Self {
+        Self { db, read_only, conn, sqls: HashMap::new(), closed: false }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -69,6 +71,7 @@ impl Stream {
             }
             StreamRequest::Sequence { sql, sql_id } => {
                 let sql = self.sql(sql.as_deref(), *sql_id)?;
+                policy::check(&sql)?;
                 self.conn.execute_script(&sql)?;
                 StreamResponse::Sequence
             }
@@ -86,6 +89,7 @@ impl Stream {
 
     fn execute(&self, stmt: &Stmt) -> Result<StmtResult, Error> {
         let sql = self.sql(stmt.sql.as_deref(), stmt.sql_id)?;
+        policy::check(&sql)?;
         let named = stmt.named_args.iter().map(|a| (a.name.clone(), a.value.clone())).collect::<Vec<_>>();
         self.conn.execute(&sql, &stmt.args, &named, stmt.want_rows.unwrap_or(true))
     }

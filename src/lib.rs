@@ -4,6 +4,7 @@
 mod auth;
 mod backup;
 mod engine;
+mod policy;
 mod proto;
 mod registry;
 mod stream;
@@ -125,10 +126,10 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
 
 async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     // Dev mode serves one database to anyone; otherwise the token names it.
-    let (database, create) = match &state.secret {
-        None => (DEV_DATABASE.to_string(), true),
+    let (database, read_only, create) = match &state.secret {
+        None => (DEV_DATABASE.to_string(), false, true),
         Some(secret) => match bearer(&req).and_then(|t| auth::verify(secret, t, unix_now())) {
-            Some(claims) => (claims.db, false),
+            Some(claims) => (claims.db, claims.read_only, false),
             None => return text(StatusCode::UNAUTHORIZED, "a valid database token is required"),
         },
     };
@@ -140,10 +141,10 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
 
     let mut stream = match &msg.baton {
         Some(baton) => match state.streams.take(baton).await {
-            Some(stream) if stream.db == database => stream,
+            Some(stream) if stream.db == database && stream.read_only == read_only => stream,
             _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
         },
-        None => match open_stream(state, &database, create).await {
+        None => match open_stream(state, &database, read_only, create).await {
             Ok(stream) => stream,
             Err(resp) => return resp,
         },
@@ -167,12 +168,12 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
 
-async fn open_stream(state: &State, database: &str, create: bool) -> Result<Stream, Resp> {
+async fn open_stream(state: &State, database: &str, read_only: bool, create: bool) -> Result<Stream, Resp> {
     let db = state.registry.open(database, create).await.map_err(registry_error)?;
-    let options = engine::ConnOptions { busy_timeout: BUSY_TIMEOUT };
+    let options = engine::ConnOptions { busy_timeout: BUSY_TIMEOUT, read_only };
     let conn = engine::Conn::open(&db, &options)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
-    Ok(Stream::new(database.to_string(), conn))
+    Ok(Stream::new(database.to_string(), read_only, conn))
 }
 
 async fn list_databases(state: &State) -> Resp {
@@ -236,6 +237,8 @@ async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp
     #[derive(Deserialize)]
     struct Body {
         ttl_seconds: Option<u64>,
+        #[serde(default)]
+        read_only: bool,
     }
     let Some(secret) = &state.secret else {
         return text(StatusCode::BAD_REQUEST, "tokens need a secret; dev mode has none");
@@ -247,7 +250,7 @@ async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp
     if let Err(err) = state.registry.open(name, false).await {
         return registry_error(err);
     }
-    let claims = Claims { db: name.to_string(), exp: body.ttl_seconds.map(|ttl| unix_now() + ttl) };
+    let claims = Claims { db: name.to_string(), exp: body.ttl_seconds.map(|ttl| unix_now() + ttl), read_only: body.read_only };
     json(StatusCode::OK, &json!({"token": auth::mint(secret, &claims)}))
 }
 

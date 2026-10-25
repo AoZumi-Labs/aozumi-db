@@ -17,6 +17,9 @@ pub struct Claims {
     /// Unix seconds. The token is refused from this second on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
+    /// Reads only. Absent means read-write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 pub fn mint(secret: &[u8], claims: &Claims) -> String {
