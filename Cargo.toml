@@ -1,0 +1,37 @@
+[package]
+name = "aozumi-db"
+version = "0.1.0"
+edition = "2021"
+description = "A database per app, as a file: a SQLite-compatible server that speaks libSQL's HTTP protocol"
+license = "MIT"
+repository = "https://github.com/AoZumi-Labs/aozumi-db"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+hex = "0.4"
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+turso = "0.8.3"
+
+[dev-dependencies]
+hyper = { version = "1", features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
+tempfile = "3"
+
+[profile.dev]
+# The engine is large; skipping debug info keeps target/ small on a nearly full disk.
+debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
