@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use aozumi_db::Config;
 use bytes::Bytes;
@@ -21,19 +22,23 @@ pub struct TestServer {
 impl TestServer {
     /// Dev mode: no secret, one database named `default`.
     pub async fn dev() -> Self {
-        Self::start(None).await
+        Self::start(None, None).await
+    }
+
+    pub async fn dev_with_idle_timeout(idle: Duration) -> Self {
+        Self::start(None, Some(idle)).await
     }
 
     pub async fn with_secret() -> Self {
-        Self::start(Some(SECRET)).await
+        Self::start(Some(SECRET), None).await
     }
 
-    async fn start(secret: Option<&str>) -> Self {
+    async fn start(secret: Option<&str>, idle: Option<Duration>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            data_dir: dir.path().to_path_buf(),
-            secret: secret.map(|s| s.as_bytes().to_vec()),
-        };
+        let mut config = Config::new(dir.path().to_path_buf(), secret.map(|s| s.as_bytes().to_vec()));
+        if let Some(idle) = idle {
+            config.stream_idle_timeout = idle;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });

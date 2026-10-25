@@ -4,10 +4,12 @@
 mod exec;
 mod proto;
 mod registry;
+mod stream;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -18,8 +20,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use proto::{PipelineReq, PipelineResp, StreamRequest, StreamResponse, StreamResult};
+use proto::{PipelineReq, PipelineResp};
 use registry::Registry;
+use stream::{Stream, Streams};
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const DEV_DATABASE: &str = "default";
@@ -28,14 +31,26 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// HMAC key for tokens and the admin API. `None` runs in dev mode.
     pub secret: Option<Vec<u8>>,
+    /// How long a stream may sit unused before it is closed.
+    pub stream_idle_timeout: Duration,
+}
+
+impl Config {
+    pub fn new(data_dir: PathBuf, secret: Option<Vec<u8>>) -> Self {
+        Self { data_dir, secret, stream_idle_timeout: Duration::from_secs(10) }
+    }
 }
 
 struct State {
     registry: Registry,
+    streams: Arc<Streams>,
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
-    let state = Arc::new(State { registry: Registry::new(config.data_dir) });
+    let state = Arc::new(State {
+        registry: Registry::new(config.data_dir),
+        streams: Streams::new(config.stream_idle_timeout),
+    });
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
@@ -71,32 +86,33 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         Err(err) => return text(StatusCode::BAD_REQUEST, &format!("invalid pipeline request: {err}")),
     };
 
-    let db = match state.registry.open(DEV_DATABASE).await {
-        Ok(db) => db,
-        Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot open database: {err}")),
-    };
-    let conn = match db.connect() {
-        Ok(conn) => conn,
-        Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")),
+    let database = DEV_DATABASE;
+    let mut stream = match &msg.baton {
+        Some(baton) => match state.streams.take(baton).await {
+            Some(stream) if stream.db == database => stream,
+            _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
+        },
+        None => match open_stream(state, database).await {
+            Ok(stream) => stream,
+            Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot open database: {err}")),
+        },
     };
 
     let mut results = Vec::with_capacity(msg.requests.len());
     for request in &msg.requests {
-        let outcome = match request {
-            StreamRequest::Close => Ok(StreamResponse::Close),
-            StreamRequest::Execute { stmt } => match &stmt.sql {
-                Some(sql) => exec::execute(&conn, sql, stmt).await.map(|result| StreamResponse::Execute { result }),
-                None => Err(proto::Error::new("statement has no sql", "SQL_NOT_FOUND")),
-            },
-            _ => Err(proto::Error::new("request type not supported yet", "NOT_SUPPORTED")),
-        };
-        results.push(match outcome {
-            Ok(response) => StreamResult::Ok { response },
-            Err(error) => StreamResult::Error { error },
-        });
+        results.push(stream.handle(request).await);
     }
 
-    json(StatusCode::OK, &PipelineResp { baton: None, base_url: None, results })
+    let baton = match stream.is_closed() {
+        true => None,
+        false => Some(state.streams.park(stream).await),
+    };
+    json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
+}
+
+async fn open_stream(state: &State, database: &str) -> anyhow::Result<Stream> {
+    let conn = state.registry.open(database).await?.connect()?;
+    Ok(Stream::new(database.to_string(), conn))
 }
 
 fn json<T: serde::Serialize>(status: StatusCode, body: &T) -> Resp {

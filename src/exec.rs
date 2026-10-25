@@ -12,8 +12,24 @@ pub async fn execute(conn: &Connection, sql: &str, stmt: &Stmt) -> Result<StmtRe
         .map(|c| Col { name: Some(c.name().to_string()), decltype: c.decl_type().map(str::to_string) })
         .collect::<Vec<_>>();
 
-    let args = stmt.args.iter().map(|v| v.0.clone()).collect::<Vec<_>>();
-    let mut rows = prepared.query(args).await.map_err(sql_error)?;
+    let mut rows = match (stmt.args.is_empty(), stmt.named_args.is_empty()) {
+        (_, true) => {
+            let args = stmt.args.iter().map(|v| v.0.clone()).collect::<Vec<_>>();
+            prepared.query(args).await
+        }
+        (true, false) => {
+            let args = stmt
+                .named_args
+                .iter()
+                .map(|a| (resolve_name(sql, &a.name), a.value.0.clone()))
+                .collect::<Vec<_>>();
+            prepared.query(args).await
+        }
+        (false, false) => {
+            return Err(Error::new("mixing positional and named arguments is not supported", "ARGS_INVALID"))
+        }
+    }
+    .map_err(sql_error)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(sql_error)? {
         let values = (0..cols.len())
@@ -29,6 +45,28 @@ pub async fn execute(conn: &Connection, sql: &str, stmt: &Stmt) -> Result<StmtRe
         rows: if stmt.want_rows.unwrap_or(true) { out } else { Vec::new() },
         affected_row_count: prepared.n_change(),
         last_insert_rowid: Some(conn.last_insert_rowid().to_string()),
+    })
+}
+
+/// `@libsql/client` sends object keys without the `:`, `@` or `$` prefix, so
+/// find which prefixed form the SQL actually uses.
+fn resolve_name(sql: &str, name: &str) -> String {
+    if name.starts_with([':', '@', '$', '?']) {
+        return name.to_string();
+    }
+    ['@', '$']
+        .iter()
+        .map(|p| format!("{p}{name}"))
+        .find(|candidate| uses_param(sql, candidate))
+        .unwrap_or_else(|| format!(":{name}"))
+}
+
+fn uses_param(sql: &str, param: &str) -> bool {
+    sql.match_indices(param).any(|(at, _)| {
+        sql[at + param.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
     })
 }
 
