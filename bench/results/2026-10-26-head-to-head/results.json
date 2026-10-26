@@ -1,0 +1,332 @@
+{
+  "runs": {
+    "libsql/ycsb_A_ops": [
+      944.0,
+      1103.0
+    ],
+    "libsql/ycsb_A_p99_ms": [
+      85.96,
+      108.47
+    ],
+    "libsql/ycsb_A_refused": [
+      57.0,
+      34.0
+    ],
+    "libsql/ycsb_B_ops": [
+      4582.0,
+      1895.0
+    ],
+    "libsql/ycsb_B_p99_ms": [
+      13.94,
+      22.43
+    ],
+    "libsql/ycsb_B_refused": [
+      2.0,
+      49.0
+    ],
+    "libsql/ycsb_C_ops": [
+      4358.0,
+      3510.0
+    ],
+    "libsql/ycsb_C_p99_ms": [
+      14.13,
+      35.09
+    ],
+    "libsql/ycsb_C_refused": [
+      0.0,
+      0.0
+    ],
+    "libsql/ycsb_D_ops": [
+      1087.0,
+      47.0
+    ],
+    "libsql/ycsb_D_p99_ms": [
+      17.23,
+      16.6
+    ],
+    "libsql/ycsb_D_refused": [
+      37.0,
+      32.0
+    ],
+    "libsql/ycsb_E_ops": [
+      40.0,
+      38.0
+    ],
+    "libsql/ycsb_E_p99_ms": [
+      38.32,
+      112.98
+    ],
+    "libsql/ycsb_E_refused": [
+      32.0,
+      32.0
+    ],
+    "libsql/ycsb_F_ops": [
+      5.0,
+      5.0
+    ],
+    "libsql/ycsb_F_p99_ms": [
+      28.02,
+      32.98
+    ],
+    "libsql/ycsb_F_refused": [
+      32.0,
+      32.0
+    ],
+    "libsql/write_p50_ms": [
+      1640.33
+    ],
+    "libsql/write_p99_ms": [
+      3253.04
+    ],
+    "libsql/write_p999_ms": [
+      3322.1
+    ],
+    "libsql/write_refused": [
+      2184.0
+    ],
+    "aozumi-full/ycsb_A_ops": [
+      15311.0,
+      11714.0
+    ],
+    "aozumi-full/ycsb_A_p99_ms": [
+      6.49,
+      12.08
+    ],
+    "aozumi-full/ycsb_A_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/ycsb_B_ops": [
+      36482.0,
+      32063.0
+    ],
+    "aozumi-full/ycsb_B_p99_ms": [
+      2.03,
+      3.16
+    ],
+    "aozumi-full/ycsb_B_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/ycsb_C_ops": [
+      39851.0,
+      35022.0
+    ],
+    "aozumi-full/ycsb_C_p99_ms": [
+      1.66,
+      2.39
+    ],
+    "aozumi-full/ycsb_C_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/ycsb_D_ops": [
+      32160.0,
+      28723.0
+    ],
+    "aozumi-full/ycsb_D_p99_ms": [
+      4.35,
+      4.99
+    ],
+    "aozumi-full/ycsb_D_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/ycsb_E_ops": [
+      5099.0,
+      4085.0
+    ],
+    "aozumi-full/ycsb_E_p99_ms": [
+      14.59,
+      21.06
+    ],
+    "aozumi-full/ycsb_E_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/ycsb_F_ops": [
+      13254.0,
+      11498.0
+    ],
+    "aozumi-full/ycsb_F_p99_ms": [
+      7.39,
+      8.98
+    ],
+    "aozumi-full/ycsb_F_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-full/write_p50_ms": [
+      1.7,
+      1.43
+    ],
+    "aozumi-full/write_p99_ms": [
+      217.32,
+      213.01
+    ],
+    "aozumi-full/write_p999_ms": [
+      281.38,
+      283.47
+    ],
+    "aozumi-full/write_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_A_ops": [
+      13678.0,
+      6752.0
+    ],
+    "aozumi-normal/ycsb_A_p99_ms": [
+      11.79,
+      28.11
+    ],
+    "aozumi-normal/ycsb_A_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_B_ops": [
+      23161.0,
+      30609.0
+    ],
+    "aozumi-normal/ycsb_B_p99_ms": [
+      7.12,
+      3.95
+    ],
+    "aozumi-normal/ycsb_B_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_C_ops": [
+      37436.0,
+      33395.0
+    ],
+    "aozumi-normal/ycsb_C_p99_ms": [
+      1.82,
+      2.57
+    ],
+    "aozumi-normal/ycsb_C_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_D_ops": [
+      31585.0,
+      26589.0
+    ],
+    "aozumi-normal/ycsb_D_p99_ms": [
+      4.55,
+      5.91
+    ],
+    "aozumi-normal/ycsb_D_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_E_ops": [
+      2234.0,
+      4646.0
+    ],
+    "aozumi-normal/ycsb_E_p99_ms": [
+      168.19,
+      17.97
+    ],
+    "aozumi-normal/ycsb_E_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/ycsb_F_ops": [
+      11759.0,
+      12480.0
+    ],
+    "aozumi-normal/ycsb_F_p99_ms": [
+      17.3,
+      13.63
+    ],
+    "aozumi-normal/ycsb_F_refused": [
+      0.0,
+      0.0
+    ],
+    "aozumi-normal/write_p50_ms": [
+      1.47,
+      1.16
+    ],
+    "aozumi-normal/write_p99_ms": [
+      229.45,
+      18.53
+    ],
+    "aozumi-normal/write_p999_ms": [
+      258.4,
+      58.76
+    ],
+    "aozumi-normal/write_refused": [
+      0.0,
+      0.0
+    ]
+  },
+  "medians": {
+    "libsql/ycsb_A_ops": 1023.5,
+    "libsql/ycsb_A_p99_ms": 97.215,
+    "libsql/ycsb_A_refused": 45.5,
+    "libsql/ycsb_B_ops": 3238.5,
+    "libsql/ycsb_B_p99_ms": 18.185,
+    "libsql/ycsb_B_refused": 25.5,
+    "libsql/ycsb_C_ops": 3934.0,
+    "libsql/ycsb_C_p99_ms": 24.610000000000003,
+    "libsql/ycsb_C_refused": 0.0,
+    "libsql/ycsb_D_ops": 567.0,
+    "libsql/ycsb_D_p99_ms": 16.915,
+    "libsql/ycsb_D_refused": 34.5,
+    "libsql/ycsb_E_ops": 39.0,
+    "libsql/ycsb_E_p99_ms": 75.65,
+    "libsql/ycsb_E_refused": 32.0,
+    "libsql/ycsb_F_ops": 5.0,
+    "libsql/ycsb_F_p99_ms": 30.5,
+    "libsql/ycsb_F_refused": 32.0,
+    "libsql/write_p50_ms": 1640.33,
+    "libsql/write_p99_ms": 3253.04,
+    "libsql/write_p999_ms": 3322.1,
+    "libsql/write_refused": 2184.0,
+    "aozumi-full/ycsb_A_ops": 13512.5,
+    "aozumi-full/ycsb_A_p99_ms": 9.285,
+    "aozumi-full/ycsb_A_refused": 0.0,
+    "aozumi-full/ycsb_B_ops": 34272.5,
+    "aozumi-full/ycsb_B_p99_ms": 2.5949999999999998,
+    "aozumi-full/ycsb_B_refused": 0.0,
+    "aozumi-full/ycsb_C_ops": 37436.5,
+    "aozumi-full/ycsb_C_p99_ms": 2.025,
+    "aozumi-full/ycsb_C_refused": 0.0,
+    "aozumi-full/ycsb_D_ops": 30441.5,
+    "aozumi-full/ycsb_D_p99_ms": 4.67,
+    "aozumi-full/ycsb_D_refused": 0.0,
+    "aozumi-full/ycsb_E_ops": 4592.0,
+    "aozumi-full/ycsb_E_p99_ms": 17.825,
+    "aozumi-full/ycsb_E_refused": 0.0,
+    "aozumi-full/ycsb_F_ops": 12376.0,
+    "aozumi-full/ycsb_F_p99_ms": 8.185,
+    "aozumi-full/ycsb_F_refused": 0.0,
+    "aozumi-full/write_p50_ms": 1.565,
+    "aozumi-full/write_p99_ms": 215.165,
+    "aozumi-full/write_p999_ms": 282.425,
+    "aozumi-full/write_refused": 0.0,
+    "aozumi-normal/ycsb_A_ops": 10215.0,
+    "aozumi-normal/ycsb_A_p99_ms": 19.95,
+    "aozumi-normal/ycsb_A_refused": 0.0,
+    "aozumi-normal/ycsb_B_ops": 26885.0,
+    "aozumi-normal/ycsb_B_p99_ms": 5.535,
+    "aozumi-normal/ycsb_B_refused": 0.0,
+    "aozumi-normal/ycsb_C_ops": 35415.5,
+    "aozumi-normal/ycsb_C_p99_ms": 2.195,
+    "aozumi-normal/ycsb_C_refused": 0.0,
+    "aozumi-normal/ycsb_D_ops": 29087.0,
+    "aozumi-normal/ycsb_D_p99_ms": 5.23,
+    "aozumi-normal/ycsb_D_refused": 0.0,
+    "aozumi-normal/ycsb_E_ops": 3440.0,
+    "aozumi-normal/ycsb_E_p99_ms": 93.08,
+    "aozumi-normal/ycsb_E_refused": 0.0,
+    "aozumi-normal/ycsb_F_ops": 12119.5,
+    "aozumi-normal/ycsb_F_p99_ms": 15.465,
+    "aozumi-normal/ycsb_F_refused": 0.0,
+    "aozumi-normal/write_p50_ms": 1.315,
+    "aozumi-normal/write_p99_ms": 123.99,
+    "aozumi-normal/write_p999_ms": 158.57999999999998,
+    "aozumi-normal/write_refused": 0.0
+  }
+}

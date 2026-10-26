@@ -101,3 +101,34 @@ What is left on the table: the server reaches about a third of the bare
 engine's single-thread point-read rate on a shared 6-core laptop where the
 clients run too. Next: a quiet machine for numbers worth publishing, TATP,
 and profiling the read path (JSON encoding, the blocking-pool hop).
+
+## Head-to-head with libSQL's server (2026-10-26)
+
+`bench/head-to-head.sh` runs the same YCSB and open-loop client against
+libSQL's own server (`sqld` 0.24.32, default settings, one local database)
+and aozumi-db, each on a fresh empty directory, alternating the order per
+round. aozumi-db is run twice: with its default durability (`synchronous =
+FULL`) and with `AOZUMI_DB_SYNCHRONOUS=normal`, which is what `sqld` uses.
+Raw output, medians and charts: `bench/results/2026-10-26-head-to-head/`.
+
+Two rounds completed (the third was stopped), at load average 6 to 37, so
+read these as large-gap results only.
+
+| YCSB, 32 clients, 100k records | aozumi-db | aozumi-db (normal) | libSQL server, per round |
+|---|---:|---:|---:|
+| A (50% update) | 13,512 ops/s | 10,215 | 944 / 1,103, plus 57 / 34 refused busy |
+| B (5% update) | 34,272 | 26,885 | 4,582 / 1,895 (stalled in round 2) |
+| C (read only) | 37,436 | 35,416 | 4,358 / 3,510 |
+| A p99 | 9.29 ms | 19.95 ms | 85.96 / 108.47 ms |
+
+What happened on libSQL's server: under 32 concurrent clients it refuses
+some writes with `SQLITE_BUSY`, and in every round it then stopped answering
+altogether: all 32 clients timed out (10 s) from workload D or earlier, and
+an earlier run stayed stuck for over an hour with the server spinning on 5
+cores in its write-lock acquire path. Its D, E, F and open-loop numbers
+therefore measure that stall, not its speed, and are left out above.
+aozumi-db refused nothing and timed out nothing: writers queue per database
+instead of racing for the lock.
+
+Not yet done: a quiet machine, more rounds, and `sqld` tuning beyond its
+defaults.

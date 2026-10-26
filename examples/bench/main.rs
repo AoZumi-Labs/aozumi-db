@@ -15,7 +15,8 @@
 //! same machine only.
 //!
 //! - `ycsb`: the YCSB core workloads (see ycsb.rs), closed loop: every
-//!   client sends its next request as soon as the last one returns.
+//!   client sends its next request as soon as the last one returns. Requests
+//!   the server refuses as busy count as failed, not as throughput.
 //! - `latency`: single-row write transactions arriving on a fixed schedule
 //!   (open loop), timed from when each was due, so time spent queued
 //!   behind a slow writer counts (no coordinated omission). The same
@@ -26,7 +27,7 @@
 mod ycsb;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,8 +100,8 @@ fn main() {
         "ycsb" => clients.block_on(async {
             println!("YCSB, {} records, {} clients, {}s per workload, {machine}\n", args.records, args.clients, args.seconds);
             ycsb_load(&url, args.records).await;
-            println!("| workload | ops/s | p50 | p99 | p99.9 | by operation (p50 / p99) |");
-            println!("|---|---:|---:|---:|---:|---|");
+            println!("| workload | ops/s | p50 | p99 | p99.9 | by operation (p50 / p99) | failed: busy or timed out |");
+            println!("|---|---:|---:|---:|---:|---|---:|");
             // One keyspace for all workloads: inserts in D and E add records.
             let keys = ycsb::Keyspace::new(args.records);
             for name in args.workloads {
@@ -117,7 +118,7 @@ fn main() {
         }),
         "latency" => clients.block_on(async {
             println!("Open-loop write latency, {} tx/s, {} connections, {}s, {machine}\n", args.rate, args.clients, args.seconds);
-            send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await;
+            assert!(send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await);
             open_loop(&url, args.clients, args.rate, duration).await;
             if local {
                 let wal = std::fs::metadata(dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
@@ -149,35 +150,68 @@ pub fn execute_args(sql: &str, args: Value) -> Value {
     json!({"type": "execute", "stmt": {"sql": sql, "args": args}})
 }
 
+/// "0", or "n (x%)" plus how many of those timed out rather than being
+/// refused as busy.
+fn failed_cell(failed: u64, succeeded: usize) -> String {
+    let timed_out = TIMED_OUT.swap(0, Ordering::Relaxed);
+    match failed {
+        0 => "0".to_string(),
+        n if timed_out == 0 => format!("{n} ({:.1}%)", 100.0 * n as f64 / (n as f64 + succeeded as f64)),
+        n => format!("{n} ({:.1}%), {timed_out} timed out", 100.0 * n as f64 / (n as f64 + succeeded as f64)),
+    }
+}
+
 fn new_client() -> HttpClient {
     Client::builder(TokioExecutor::new()).pool_max_idle_per_host(1).build_http()
 }
 
-async fn send(client: &HttpClient, url: &str, mut requests: Vec<Value>) {
+/// A request with no answer by then counts as failed, so a server that
+/// stalls shows up in the results instead of hanging the benchmark.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Send one pipeline. Returns false if the server refused it as busy
+/// (`SQLITE_BUSY`) or did not answer within `REQUEST_TIMEOUT`: YCSB counts
+/// those as failed operations. Any other error stops the benchmark, since
+/// it would make the numbers meaningless.
+async fn send(client: &HttpClient, url: &str, mut requests: Vec<Value>) -> bool {
     requests.push(json!({"type": "close"}));
     let body = json!({"baton": null, "requests": requests}).to_string();
     let request = Request::post(url).body(Full::new(Bytes::from(body))).unwrap();
-    let response = client.request(request).await.unwrap();
-    let status = response.status();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let exchange = async {
+        let response = client.request(request).await.unwrap();
+        let status = response.status();
+        (status, response.into_body().collect().await.unwrap().to_bytes())
+    };
+    let Ok((status, body)) = tokio::time::timeout(REQUEST_TIMEOUT, exchange).await else {
+        TIMED_OUT.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
     assert!(status.is_success(), "HTTP {status}: {}", String::from_utf8_lossy(&body));
-    // An error inside the pipeline would make the numbers meaningless.
     let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let mut ok = true;
     for result in parsed["results"].as_array().unwrap() {
-        assert_eq!(result["type"], "ok", "{result}");
+        if result["type"] == "ok" {
+            continue;
+        }
+        let busy = result["error"]["code"].as_str().is_some_and(|c| c.starts_with("SQLITE_BUSY"))
+            || result["error"]["message"].as_str().is_some_and(|m| m.contains("database is locked"));
+        assert!(busy, "{result}");
+        ok = false;
     }
+    ok
 }
 
 async fn ycsb_load(url: &str, records: u64) {
     let client = new_client();
-    send(&client, url, vec![ycsb::schema()]).await;
+    assert!(send(&client, url, vec![ycsb::schema()]).await);
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let started = Instant::now();
     for chunk in (0..records).collect::<Vec<_>>().chunks(1000) {
         let mut requests = vec![execute("BEGIN")];
         requests.extend(chunk.iter().map(|n| ycsb::insert(*n, &mut rng)));
         requests.push(execute("COMMIT"));
-        send(&client, url, requests).await;
+        assert!(send(&client, url, requests).await, "loading refused as busy");
     }
     let secs = started.elapsed().as_secs_f64();
     println!("load: {records} records in {secs:.1}s ({:.0} records/s, 1000 per transaction)\n", records as f64 / secs);
@@ -201,23 +235,29 @@ async fn closed_loop(
                 let client = new_client();
                 let mut rng = rand::rngs::StdRng::seed_from_u64(c as u64);
                 let mut latencies: Vec<(&'static str, Duration)> = Vec::new();
+                let mut failed = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let (op, requests) = next(&mut rng);
                     let t = Instant::now();
-                    send(&client, &url, requests).await;
-                    latencies.push((op, t.elapsed()));
+                    match send(&client, &url, requests).await {
+                        true => latencies.push((op, t.elapsed())),
+                        false => failed += 1,
+                    }
                 }
-                latencies
+                (latencies, failed)
             })
         })
         .collect::<Vec<_>>();
     tokio::time::sleep(duration).await;
     stop.store(true, Ordering::Relaxed);
-    let mut all = Vec::new();
+    let (mut all, mut failed) = (Vec::new(), 0u64);
     for task in tasks {
-        all.extend(task.await.unwrap());
+        let (latencies, errors) = task.await.unwrap();
+        all.extend(latencies);
+        failed += errors;
     }
     let elapsed = started.elapsed().as_secs_f64();
+    let errors = failed_cell(failed, all.len());
     let mut by_op: HashMap<&str, Vec<Duration>> = HashMap::new();
     for (op, latency) in &all {
         by_op.entry(op).or_default().push(*latency);
@@ -235,7 +275,7 @@ async fn closed_loop(
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "| {label} | {:.0} | {:.2} ms | {:.2} ms | {:.2} ms | {detail} |",
+        "| {label} | {:.0} | {:.2} ms | {:.2} ms | {:.2} ms | {detail} | {errors} |",
         overall.len() as f64 / elapsed,
         ms(pct(&overall, 0.5)),
         ms(pct(&overall, 0.99)),
@@ -255,7 +295,7 @@ async fn open_loop(url: &str, connections: usize, rate: u64, duration: Duration)
                 let client = new_client();
                 let mut rng = rand::rngs::StdRng::seed_from_u64(c as u64);
                 let offset = interval.mul_f64(c as f64 / connections as f64);
-                let mut latencies = Vec::new();
+                let (mut latencies, mut failed) = (Vec::new(), 0u64);
                 let mut n = 0u32;
                 loop {
                     let due = start + offset + interval * n;
@@ -264,23 +304,31 @@ async fn open_loop(url: &str, connections: usize, rate: u64, duration: Duration)
                     }
                     tokio::time::sleep_until(due.into()).await;
                     let data: String = (0..100).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
-                    send(&client, &url, vec![execute_args("INSERT INTO test_table (data) VALUES (?)", json!([text(data)]))]).await;
-                    latencies.push(due.elapsed());
+                    match send(&client, &url, vec![execute_args("INSERT INTO test_table (data) VALUES (?)", json!([text(data)]))]).await {
+                        true => latencies.push(due.elapsed()),
+                        false => failed += 1,
+                    }
                     n += 1;
                 }
-                latencies
+                (latencies, failed)
             })
         })
         .collect::<Vec<_>>();
-    let mut all = Vec::new();
+    let (mut all, mut failed) = (Vec::new(), 0u64);
     for task in tasks {
-        all.extend(task.await.unwrap());
+        let (latencies, errors) = task.await.unwrap();
+        all.extend(latencies);
+        failed += errors;
     }
     all.sort();
-    println!("| offered | completed | p50 | p90 | p99 | p99.9 | max |");
-    println!("|---:|---:|---:|---:|---:|---:|---:|");
+    let failed = failed_cell(failed, all.len());
+    if all.is_empty() {
+        all.push(REQUEST_TIMEOUT);
+    }
+    println!("| offered | committed | p50 | p90 | p99 | p99.9 | max | failed: busy or timed out |");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|");
     println!(
-        "| {rate}/s | {:.0}/s | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms |",
+        "| {rate}/s | {:.0}/s | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms | {failed} |",
         all.len() as f64 / duration.as_secs_f64(),
         ms(pct(&all, 0.5)),
         ms(pct(&all, 0.9)),
@@ -300,11 +348,11 @@ async fn micro(url: &str, clients: usize, duration: Duration) {
     ];
     requests.extend((0..ROWS).map(|k| execute_args("INSERT INTO kv VALUES (?, ?)", json!([int(k), text(format!("value-{k}"))]))));
     requests.push(execute("COMMIT"));
-    send(&client, url, requests).await;
+    assert!(send(&client, url, requests).await);
 
     println!("micro, {clients} clients, {}s each\n", duration.as_secs());
-    println!("| scenario | ops/s | p50 | p99 | p99.9 | |");
-    println!("|---|---:|---:|---:|---:|---|");
+    println!("| scenario | ops/s | p50 | p99 | p99.9 | | failed: busy or timed out |");
+    println!("|---|---:|---:|---:|---:|---|---:|");
     closed_loop("point read", url, clients, duration, |rng| {
         ("read", vec![execute_args("SELECT v FROM kv WHERE k = ?", json!([int(rng.gen_range(0..ROWS))]))])
     })
