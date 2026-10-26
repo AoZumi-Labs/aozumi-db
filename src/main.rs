@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config, Limits};
+use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config, Limits, Synchronous};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
@@ -43,6 +43,14 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
     let mut config = Config::new(data_dir.clone(), secret);
     config.backup = backup_config()?;
     config.default_limits = default_limits()?;
+    config.synchronous = match std::env::var("AOZUMI_DB_SYNCHRONOUS").as_deref() {
+        Err(_) | Ok("full") => Synchronous::Full,
+        Ok("normal") => {
+            eprintln!("aozumi-db: synchronous = normal: commits reach the disk at checkpoints; a power loss can lose the last few");
+            Synchronous::Normal
+        }
+        Ok(other) => anyhow::bail!("AOZUMI_DB_SYNCHRONOUS must be full or normal, got {other:?}"),
+    };
     if config.backup.is_none() {
         eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");
     }

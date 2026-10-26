@@ -4,6 +4,11 @@
 //!     cargo run --release --example bench -- latency [--rate N] [--clients N] [--seconds N]
 //!     cargo run --release --example bench -- micro [--clients N] [--seconds N]
 //!
+//! Add `--url http://host:port` to benchmark a server running elsewhere
+//! instead of one in this process: another aozumi-db, or any server that
+//! speaks libSQL's HTTP protocol (such as libSQL's own server), without
+//! auth, against an empty database.
+//!
 //! The server runs in this process on its own 4-thread runtime; clients run
 //! on another 2-thread runtime over keep-alive HTTP/1.1, as `@libsql/client`
 //! does. Clients and server share the machine, so compare runs made on the
@@ -42,12 +47,17 @@ struct Args {
     clients: usize,
     seconds: u64,
     rate: u64,
+    url: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
-    let mut parsed = Args { mode: args.next().unwrap_or_else(|| "micro".into()), workloads: vec![], records: 100_000, clients: 32, seconds: 10, rate: 1000 };
+    let mut parsed = Args { mode: args.next().unwrap_or_else(|| "micro".into()), workloads: vec![], records: 100_000, clients: 32, seconds: 10, rate: 1000, url: None };
     while let Some(arg) = args.next() {
+        if arg == "--url" {
+            parsed.url = Some(args.next().expect("a URL after --url").trim_end_matches('/').to_string());
+            continue;
+        }
         let mut value = || args.next().and_then(|v| v.parse().ok()).expect("a number after the flag");
         match arg.as_str() {
             "--records" => parsed.records = value(),
@@ -67,14 +77,20 @@ fn main() {
     let args = parse_args();
     let dir = tempfile::tempdir().unwrap();
     let server = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
-    let addr = server.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let config = aozumi_db::Config::new(dir.path().to_path_buf(), None);
-        tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });
-        addr
-    });
-    let url = format!("http://{addr}/v2/pipeline");
+    let url = match &args.url {
+        Some(url) => format!("{url}/v2/pipeline"),
+        None => {
+            let addr = server.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let config = aozumi_db::Config::new(dir.path().to_path_buf(), None);
+                tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });
+                addr
+            });
+            format!("http://{addr}/v2/pipeline")
+        }
+    };
+    let local = args.url.is_none();
     let clients = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let duration = Duration::from_secs(args.seconds);
     let machine = format!("{} cores", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
@@ -103,12 +119,16 @@ fn main() {
             println!("Open-loop write latency, {} tx/s, {} connections, {}s, {machine}\n", args.rate, args.clients, args.seconds);
             send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await;
             open_loop(&url, args.clients, args.rate, duration).await;
-            let wal = std::fs::metadata(dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
-            println!("\nWAL at the end: {:.1} MB", wal as f64 / 1e6);
+            if local {
+                let wal = std::fs::metadata(dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
+                println!("\nWAL at the end: {:.1} MB", wal as f64 / 1e6);
+            }
         }),
         _ => {
             clients.block_on(micro(&url, args.clients, duration));
-            engine_baseline(dir.path(), duration);
+            if local {
+                engine_baseline(dir.path(), duration);
+            }
         }
     }
 }

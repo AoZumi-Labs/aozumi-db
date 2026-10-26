@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
-use crate::engine::{self, Conn, ConnOptions, Db, WalPosition};
+use crate::engine::{self, Conn, ConnOptions, Db, Synchronous, WalPosition};
 use crate::limits::{Limits, LimitsPatch};
 use crate::proto::Value;
 
@@ -32,6 +32,7 @@ pub struct OpenDb {
     pub writers: Arc<Mutex<()>>,
     /// Idle connections, reused instead of opened per request.
     pub pool: Arc<Pool>,
+    synchronous: Synchronous,
 }
 
 /// Idle connections of one database, kept per access level. Connections
@@ -75,6 +76,7 @@ impl OpenDb {
     /// Connection settings that enforce this database's limits.
     pub fn conn_options(&self, busy_timeout: Duration, read_only: bool) -> ConnOptions {
         ConnOptions {
+            synchronous: self.synchronous,
             busy_timeout,
             read_only,
             max_pages: self.limits.max_size_bytes.map(|bytes| (bytes / self.page_size).max(1)),
@@ -92,13 +94,14 @@ impl OpenDb {
 
     /// Settings for the server's own connections: no tenant limits.
     pub fn internal_options(&self) -> ConnOptions {
-        ConnOptions::default()
+        ConnOptions { synchronous: self.synchronous, ..Default::default() }
     }
 }
 
 pub struct Registry {
     dir: PathBuf,
     defaults: Limits,
+    synchronous: Synchronous,
     open: Mutex<HashMap<String, OpenDb>>,
 }
 
@@ -126,8 +129,8 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Registry {
-    pub fn new(dir: PathBuf, defaults: Limits) -> Self {
-        Self { dir, defaults, open: Mutex::new(HashMap::new()) }
+    pub fn new(dir: PathBuf, defaults: Limits, synchronous: Synchronous) -> Self {
+        Self { dir, defaults, synchronous, open: Mutex::new(HashMap::new()) }
     }
 
     /// Checkpoint every open database whose WAL has grown past
@@ -340,6 +343,7 @@ impl Registry {
     async fn build(&self, name: &str, limits: Limits) -> anyhow::Result<OpenDb> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path(name);
+        let synchronous = self.synchronous;
         tokio::task::spawn_blocking(move || {
             let db = engine::open(&path)?;
             let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
@@ -347,7 +351,7 @@ impl Registry {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default() })
+            Ok(OpenDb { db, limits, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
         })
         .await?
     }

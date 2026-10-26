@@ -22,8 +22,21 @@ pub fn open(path: &Path) -> Result<Db, LimboError> {
     Database::open_file(io, path, Arc::new(SqliteDialect))
 }
 
+/// When a commit reaches the disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Synchronous {
+    /// Every commit is flushed (fsync) before it is acknowledged: nothing
+    /// acknowledged is lost, even on power loss.
+    #[default]
+    Full,
+    /// Commits are flushed at checkpoints. A crash of the server keeps
+    /// every commit; a power loss can lose the last few. Faster writes.
+    Normal,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConnOptions {
+    pub synchronous: Synchronous,
     /// How long a statement waits for another writer before failing.
     pub busy_timeout: Duration,
     /// The engine refuses every write on this connection.
@@ -69,6 +82,9 @@ impl Conn {
         inner.set_query_only(options.read_only);
         if let Some(timeout) = options.statement_timeout {
             inner.set_query_timeout(timeout);
+        }
+        if options.synchronous == Synchronous::Normal {
+            inner.execute("PRAGMA synchronous = NORMAL")?;
         }
         if let Some(pages) = options.max_pages {
             // Set by the server, not tenant SQL, which may not change it.

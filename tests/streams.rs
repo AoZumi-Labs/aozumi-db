@@ -175,3 +175,14 @@ async fn the_wal_stays_bounded_without_any_backups() {
     assert!(wal < 4 * 1024 * 1024, "the WAL was checkpointed ({wal} bytes)");
     assert_eq!(count(&server.run(None, vec![execute("SELECT count(*) FROM t")]).await), "2000");
 }
+
+#[tokio::test]
+async fn commits_are_flushed_to_disk_unless_configured_otherwise() {
+    let synchronous = |results: Vec<serde_json::Value>| results[0]["response"]["result"]["rows"][0][0]["value"].clone();
+
+    let full = TestServer::dev().await;
+    assert_eq!(synchronous(full.run(None, vec![execute("PRAGMA synchronous")]).await), "2", "FULL by default");
+
+    let normal = TestServer::start_with(None, |c| c.synchronous = aozumi_db::Synchronous::Normal).await;
+    assert_eq!(synchronous(normal.run(None, vec![execute("PRAGMA synchronous")]).await), "1");
+}

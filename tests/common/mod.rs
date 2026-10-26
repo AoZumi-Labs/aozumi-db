@@ -59,6 +59,10 @@ impl TestServer {
         Self::start(Some(SECRET), move |c| c.backup = Some(backup)).await
     }
 
+    pub async fn start_with(secret: Option<&str>, tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start(secret, tweak).await
+    }
+
     async fn start(secret: Option<&str>, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::new(dir.path().to_path_buf(), secret.map(|s| s.as_bytes().to_vec()));

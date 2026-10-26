@@ -30,6 +30,7 @@ pub use auth::{mint as mint_token, Claims};
 pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
 use backup::{BackupError, Backups};
 use proto::{PipelineReq, PipelineResp};
+pub use engine::Synchronous;
 pub use limits::Limits;
 use limits::{LimitsPatch, RateLimiter};
 use registry::{Registry, RegistryError};
@@ -53,6 +54,8 @@ pub struct Config {
     pub backup: Option<BackupConfig>,
     /// Limits for new databases; each database keeps its own copy.
     pub default_limits: Limits,
+    /// When commits reach the disk. `Full` unless chosen otherwise.
+    pub synchronous: Synchronous,
 }
 
 impl Config {
@@ -63,6 +66,7 @@ impl Config {
             stream_idle_timeout: Duration::from_secs(10),
             backup: None,
             default_limits: Limits::default(),
+            synchronous: Synchronous::Full,
         }
     }
 }
@@ -78,7 +82,7 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir, config.default_limits),
+        registry: Registry::new(config.data_dir, config.default_limits, config.synchronous),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
