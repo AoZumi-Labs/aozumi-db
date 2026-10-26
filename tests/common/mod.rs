@@ -24,6 +24,8 @@ pub struct Backups {
     pub dir: std::path::PathBuf,
     pub keep: usize,
     pub every: Option<Duration>,
+    /// Ship the WAL this often for point-in-time restore. `None` = off.
+    pub wal: Option<Duration>,
 }
 
 impl TestServer {
@@ -45,11 +47,15 @@ impl TestServer {
     }
 
     pub async fn with_backups(backups: &Backups) -> Self {
-        Self::with_backup_target(BackupTarget::directory(backups.dir.clone()), backups.keep, backups.every).await
+        let target = BackupTarget::directory(backups.dir.clone());
+        Self::with_backup(BackupConfig { target, keep: backups.keep, every: backups.every, wal_every: backups.wal }).await
     }
 
     pub async fn with_backup_target(target: BackupTarget, keep: usize, every: Option<Duration>) -> Self {
-        let backup = BackupConfig { target, keep, every };
+        Self::with_backup(BackupConfig { target, keep, every, wal_every: None }).await
+    }
+
+    pub async fn with_backup(backup: BackupConfig) -> Self {
         Self::start(Some(SECRET), move |c| c.backup = Some(backup)).await
     }
 

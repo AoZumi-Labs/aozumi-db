@@ -131,12 +131,17 @@ impl S3 {
         Ok(())
     }
 
-    /// Keys under `prefix` (relative to the store's own prefix) with sizes.
+    /// Keys directly under `prefix` (a "directory" ending in `/`, relative
+    /// to the store's own prefix), with sizes.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let mut query = vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), format!("{}{prefix}", self.prefix))];
+            let mut query = vec![
+                ("list-type".to_string(), "2".to_string()),
+                ("prefix".to_string(), format!("{}{prefix}", self.prefix)),
+                ("delimiter".to_string(), "/".to_string()),
+            ];
             if let Some(token) = &token {
                 query.push(("continuation-token".to_string(), token.clone()));
             }

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 fn backups(keep: usize, every: Option<Duration>) -> (tempfile::TempDir, Backups) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = Backups { dir: dir.path().to_path_buf(), keep, every };
+    let cfg = Backups { dir: dir.path().to_path_buf(), keep, every, wal: None };
     (dir, cfg)
 }
 

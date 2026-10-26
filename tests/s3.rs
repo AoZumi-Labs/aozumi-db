@@ -125,7 +125,9 @@ fn list(objects: &BTreeMap<String, Vec<u8>>, query: &str) -> Response<Full<Bytes
     assert_eq!(params.get("list-type").map(String::as_str), Some("2"));
     let prefix = params.get("prefix").cloned().unwrap_or_default();
     let after = params.get("continuation-token").cloned().unwrap_or_default();
-    let mut matching = objects.iter().filter(|(k, _)| k.starts_with(&prefix) && **k > after);
+    // With a delimiter, keys in deeper "directories" are left out.
+    let shallow = |k: &str| params.get("delimiter").is_none_or(|d| !k[prefix.len()..].contains(d.as_str()));
+    let mut matching = objects.iter().filter(|(k, _)| k.starts_with(&prefix) && **k > after && shallow(k));
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");
     if let Some((key, bytes)) = matching.next() {
         xml += &format!("<Contents><Key>{key}</Key><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>", bytes.len());

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use turso_core::Numeric;
-use turso_core::{Database, LimboError, SqliteDialect, Value as Core, IO};
+use turso_core::{CheckpointMode, Database, LimboError, SqliteDialect, Value as Core, IO};
 
 use crate::proto::{Col, Error, StmtResult, Value};
 
@@ -30,7 +30,21 @@ pub struct ConnOptions {
     pub max_pages: Option<u64>,
     /// Statements running longer than this are interrupted.
     pub statement_timeout: Option<Duration>,
+    /// Never checkpoint or restart the WAL on commit: the WAL shipper owns
+    /// that, so no frame is overwritten before it has been backed up.
+    pub manual_wal: bool,
 }
+
+/// Where a database's WAL is: which incarnation (bumped each time the WAL
+/// restarts) and the last committed frame in it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WalPosition {
+    pub seq: u32,
+    pub frame: u64,
+}
+
+/// Bytes of one WAL frame header.
+pub const FRAME_HEADER: usize = 24;
 
 pub struct Conn {
     inner: Arc<turso_core::Connection>,
@@ -40,6 +54,9 @@ pub struct Conn {
 impl Conn {
     pub fn open(db: &Db, options: &ConnOptions) -> Result<Self, LimboError> {
         let inner = db.connect()?;
+        if options.manual_wal {
+            inner.wal_auto_actions_disable();
+        }
         inner.set_busy_timeout(options.busy_timeout);
         inner.set_query_only(options.read_only);
         if let Some(timeout) = options.statement_timeout {
@@ -101,6 +118,42 @@ impl Conn {
     /// Run every statement in `sql`, ignoring rows.
     pub fn execute_script(&self, sql: &str) -> Result<(), Error> {
         self.inner.execute(sql).map_err(|err| self.error(err))
+    }
+
+    /// The WAL's current position, as of now rather than this connection's
+    /// last read.
+    pub fn wal_position(&self) -> anyhow::Result<WalPosition> {
+        // Reading the schema starts a fresh read, which refreshes the view.
+        self.execute("SELECT count(*) FROM sqlite_schema", &[], &[], false)?;
+        let state = self.inner.wal_state()?;
+        Ok(WalPosition { seq: state.checkpoint_seq_no, frame: state.max_frame })
+    }
+
+    /// Frames `from..=to`, header included, cut after the last commit frame.
+    /// Returns the bytes and the number of the last frame included.
+    pub fn committed_frames(&self, from: u64, to: u64, page_size: usize) -> anyhow::Result<(Vec<u8>, u64)> {
+        let frame_size = FRAME_HEADER + page_size;
+        let mut out = Vec::with_capacity((to + 1 - from) as usize * frame_size);
+        let mut frame = vec![0u8; frame_size];
+        let (mut kept, mut last) = (0, from - 1);
+        for number in from..=to {
+            let info = self.inner.wal_get_frame(number, &mut frame)?;
+            out.extend_from_slice(&frame);
+            if info.is_commit_frame() {
+                kept = out.len();
+                last = number;
+            }
+        }
+        out.truncate(kept);
+        Ok((out, last))
+    }
+
+    /// Copy every WAL frame into the database file and empty the WAL.
+    /// Returns how many frames were copied, so the caller can tell whether
+    /// any arrived that it had not seen.
+    pub fn checkpoint_truncate(&self) -> anyhow::Result<u64> {
+        let result = self.inner.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
+        Ok(result.wal_checkpoint_backfilled)
     }
 
     fn error(&self, err: LimboError) -> Error {

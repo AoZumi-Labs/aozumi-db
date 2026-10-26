@@ -56,7 +56,8 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
 }
 
 /// `AOZUMI_DB_BACKUP_URL` turns backups on; `AOZUMI_DB_BACKUP_EVERY` (seconds,
-/// 0 = only on request) and `AOZUMI_DB_BACKUP_KEEP` tune them.
+/// 0 = only on request), `AOZUMI_DB_BACKUP_KEEP` and `AOZUMI_DB_BACKUP_WAL_MS`
+/// (point-in-time restore; 0 = off) tune them.
 fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
     let Some(url) = std::env::var("AOZUMI_DB_BACKUP_URL").ok().filter(|u| !u.is_empty()) else {
         return Ok(None);
@@ -69,11 +70,16 @@ fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
     };
     let every = number("AOZUMI_DB_BACKUP_EVERY", 300)?;
     let keep = number("AOZUMI_DB_BACKUP_KEEP", 24)?;
+    let wal_ms = number("AOZUMI_DB_BACKUP_WAL_MS", 1000)?;
     eprintln!("aozumi-db: backing up to {url}, every {every}s when changed, keeping {keep} per database");
+    if wal_ms > 0 {
+        eprintln!("aozumi-db: shipping the WAL every {wal_ms}ms for point-in-time restore");
+    }
     Ok(Some(BackupConfig {
         target: BackupTarget::parse(&url)?,
         keep: keep.max(1) as usize,
         every: (every > 0).then(|| Duration::from_secs(every)),
+        wal_every: (wal_ms > 0).then(|| Duration::from_millis(wal_ms)),
     }))
 }
 

@@ -74,11 +74,26 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir, config.default_limits),
+        registry: Registry::new(
+            config.data_dir,
+            config.default_limits,
+            config.backup.as_ref().is_some_and(|b| b.wal_every.is_some()),
+        ),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
     });
+    if let Some(every) = state.backups.wal_every() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.ship_all(&state.registry).await;
+            }
+        });
+    }
     if let Some(every) = state.backups.every() {
         let state = state.clone();
         tokio::spawn(async move {
@@ -128,10 +143,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                     Ok(info) => json(StatusCode::CREATED, &info),
                     Err(err) => backup_error(err),
                 },
-                (&Method::GET, [name, "backups"]) => match state.backups.list(name).await {
-                    Ok(backups) => json(StatusCode::OK, &json!({"backups": backups})),
-                    Err(err) => backup_error(err),
-                },
+                (&Method::GET, [name, "backups"]) => list_backups(&state, name).await,
                 _ => text(StatusCode::NOT_FOUND, "not found"),
             }
         }
@@ -226,7 +238,10 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
     #[derive(Deserialize)]
     struct Restore {
         database: String,
-        backup: String,
+        /// A snapshot id, or `latest`.
+        backup: Option<String>,
+        /// A moment to restore to: unix milliseconds or an RFC 3339 time.
+        at: Option<serde_json::Value>,
     }
     let body: Body = match read_json(req).await {
         Ok(body) => body,
@@ -236,6 +251,7 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
         Ok(limits) => limits,
         Err(err) => return registry_error(err),
     };
+    let mut restored_to_ms = None;
     let created = match body.restore {
         None => state.registry.create(&body.name, limits).await,
         Some(from) => {
@@ -245,14 +261,28 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
                 Err(RegistryError::NotFound) => {}
                 Err(err) => return registry_error(err),
             }
-            match state.backups.fetch(&from.database, &from.backup).await {
+            let fetched = match (&from.at, &from.backup) {
+                (Some(at), _) => match backup::parse_time(at) {
+                    Ok(at) => state.backups.fetch_at(&from.database, at).await.map(|restored| {
+                        restored_to_ms = Some(restored.restored_to_ms);
+                        restored.bytes
+                    }),
+                    Err(err) => Err(err),
+                },
+                (None, Some(id)) => state.backups.fetch(&from.database, id).await,
+                (None, None) => return text(StatusCode::BAD_REQUEST, "a restore needs `backup` or `at`"),
+            };
+            match fetched {
                 Ok(bytes) => state.registry.create_from(&body.name, bytes, limits).await,
                 Err(err) => return backup_error(err),
             }
         }
     };
     match created {
-        Ok(()) => json(StatusCode::CREATED, &json!({"name": body.name})),
+        Ok(()) => match restored_to_ms {
+            Some(ms) => json(StatusCode::CREATED, &json!({"name": body.name, "restored_to_ms": ms})),
+            None => json(StatusCode::CREATED, &json!({"name": body.name})),
+        },
         Err(err) => registry_error(err),
     }
 }
@@ -279,11 +309,23 @@ async fn update_limits(state: &State, name: &str, req: Request<Incoming>) -> Res
     }
 }
 
+async fn list_backups(state: &State, name: &str) -> Resp {
+    let backups = match state.backups.list(name).await {
+        Ok(backups) => backups,
+        Err(err) => return backup_error(err),
+    };
+    match state.backups.window(name).await {
+        Ok(window) => json(StatusCode::OK, &json!({"backups": backups, "point_in_time": window})),
+        Err(err) => backup_error(err),
+    }
+}
+
 async fn delete_database(state: &State, name: &str) -> Resp {
     match state.registry.delete(name).await {
         Ok(()) => {
             state.streams.close_database(name).await;
             state.rates.forget(name);
+            state.backups.forget(name).await;
             Response::builder().status(StatusCode::NO_CONTENT).body(Full::default()).unwrap()
         }
         Err(err) => registry_error(err),
@@ -350,6 +392,9 @@ fn backup_error(err: BackupError) -> Resp {
         BackupError::NotConfigured => text(StatusCode::BAD_REQUEST, "backups are not configured on this server"),
         BackupError::NotFound => text(StatusCode::NOT_FOUND, "backup not found"),
         BackupError::InvalidId => text(StatusCode::BAD_REQUEST, "backup ids are digits, or `latest`"),
+        BackupError::InvalidTime => {
+            text(StatusCode::BAD_REQUEST, "`at` is unix milliseconds or an RFC 3339 UTC time like 2026-10-26T09:30:00Z")
+        }
         BackupError::Registry(err) => registry_error(err),
         BackupError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("backup error: {err}")),
     }

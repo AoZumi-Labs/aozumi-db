@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
-use crate::engine::{self, Conn, ConnOptions, Db};
+use crate::engine::{self, Conn, ConnOptions, Db, WalPosition};
 use crate::limits::{Limits, LimitsPatch};
 use crate::proto::Value;
 
@@ -26,6 +26,13 @@ pub struct OpenDb {
     pub db: Db,
     pub limits: Limits,
     pub page_size: u64,
+    manual_wal: bool,
+}
+
+/// A consistent copy of a database, and the WAL position it includes.
+pub struct Snapshot {
+    pub bytes: Vec<u8>,
+    pub wal: WalPosition,
 }
 
 impl OpenDb {
@@ -36,13 +43,20 @@ impl OpenDb {
             read_only,
             max_pages: self.limits.max_size_bytes.map(|bytes| (bytes / self.page_size).max(1)),
             statement_timeout: self.limits.max_statement_ms.map(Duration::from_millis),
+            manual_wal: self.manual_wal,
         }
+    }
+
+    /// Settings for the server's own connections: no tenant limits.
+    pub fn internal_options(&self) -> ConnOptions {
+        ConnOptions { manual_wal: self.manual_wal, ..Default::default() }
     }
 }
 
 pub struct Registry {
     dir: PathBuf,
     defaults: Limits,
+    manual_wal: bool,
     open: Mutex<HashMap<String, OpenDb>>,
 }
 
@@ -70,8 +84,10 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Registry {
-    pub fn new(dir: PathBuf, defaults: Limits) -> Self {
-        Self { dir, defaults, open: Mutex::new(HashMap::new()) }
+    /// With `manual_wal`, no connection checkpoints the WAL on its own
+    /// (see [`ConnOptions::manual_wal`]).
+    pub fn new(dir: PathBuf, defaults: Limits, manual_wal: bool) -> Self {
+        Self { dir, defaults, manual_wal, open: Mutex::new(HashMap::new()) }
     }
 
     /// The server's limits with a create request's changes applied.
@@ -115,7 +131,7 @@ impl Registry {
         }
         let db = self.build(name, limits).await?;
         // The engine creates the file lazily; a first statement makes it real.
-        Conn::open(&db.db, &ConnOptions::default())?.execute_script("PRAGMA user_version = 0")?;
+        Conn::open(&db.db, &db.internal_options())?.execute_script("PRAGMA user_version = 0")?;
         self.write_limits(name, &limits).await?;
         open.insert(name.to_string(), db);
         Ok(())
@@ -136,7 +152,7 @@ impl Registry {
         tokio::fs::rename(&partial, self.path(name)).await?;
         let checked = async {
             let db = self.build(name, limits).await?;
-            let check = Conn::open(&db.db, &ConnOptions::default())?.execute("PRAGMA quick_check", &[], &[], true)?;
+            let check = Conn::open(&db.db, &db.internal_options())?.execute("PRAGMA quick_check", &[], &[], true)?;
             match check.rows.first().and_then(|row| row.first()) {
                 Some(Value::Text(ok)) if ok == "ok" => Ok(db),
                 other => anyhow::bail!("the backup is not a valid database: {other:?}"),
@@ -171,7 +187,7 @@ impl Registry {
     pub async fn size(&self, name: &str) -> Result<u64, RegistryError> {
         let db = self.open(name, false).await?;
         let pages = tokio::task::spawn_blocking(move || {
-            let result = Conn::open(&db.db, &ConnOptions::default())?.execute("PRAGMA page_count", &[], &[], true)?;
+            let result = Conn::open(&db.db, &db.internal_options())?.execute("PRAGMA page_count", &[], &[], true)?;
             match result.rows.first().and_then(|row| row.first()) {
                 Some(Value::Integer(pages)) => Ok(*pages as u64 * db.page_size),
                 other => anyhow::bail!("unexpected page count {other:?}"),
@@ -226,8 +242,8 @@ impl Registry {
 
     /// A consistent copy of a database as one file. Writers wait (they do
     /// not fail) while the files are copied; readers carry on.
-    pub async fn snapshot(&self, name: &str) -> Result<Vec<u8>, RegistryError> {
-        let db = self.open(name, false).await?.db;
+    pub async fn snapshot(&self, name: &str) -> Result<Snapshot, RegistryError> {
+        let db = self.open(name, false).await?;
         let scratch = self.dir.join(".tmp").join(format!("{name}-{}", rand::random::<u64>()));
         tokio::fs::create_dir_all(&scratch).await?;
         let (dir, file, work) = (self.dir.clone(), format!("{name}.db"), scratch.clone());
@@ -253,14 +269,16 @@ impl Registry {
     async fn build(&self, name: &str, limits: Limits) -> anyhow::Result<OpenDb> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path(name);
+        let manual_wal = self.manual_wal;
         tokio::task::spawn_blocking(move || {
             let db = engine::open(&path)?;
-            let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
+            let options = ConnOptions { manual_wal, ..Default::default() };
+            let result = Conn::open(&db, &options)?.execute("PRAGMA page_size", &[], &[], true)?;
             let page_size = match result.rows.first().and_then(|row| row.first()) {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, page_size })
+            Ok(OpenDb { db, limits, page_size, manual_wal })
         })
         .await?
     }
@@ -283,24 +301,26 @@ impl Registry {
 
 /// Copy a database's files while holding its write lock, then fold the
 /// copied WAL into the copied database file and return that file. Blocks.
-fn snapshot_files(db: &Db, dir: &std::path::Path, file: &str, work: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    let conn = Conn::open(db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT, ..Default::default() })?;
+fn snapshot_files(db: &OpenDb, dir: &std::path::Path, file: &str, work: &std::path::Path) -> anyhow::Result<Snapshot> {
+    let conn = Conn::open(&db.db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT, ..db.internal_options() })?;
     conn.execute_script("BEGIN IMMEDIATE")?;
     let copied = (|| {
+        // Taken under the write lock: exactly what the copy will contain.
+        let wal = conn.wal_position()?;
         for suffix in ["", "-wal"] {
             let from = dir.join(format!("{file}{suffix}"));
             if from.exists() {
                 std::fs::copy(&from, work.join(format!("{file}{suffix}")))?;
             }
         }
-        anyhow::Ok(())
+        anyhow::Ok(wal)
     })();
     conn.execute_script("ROLLBACK")?;
-    copied?;
+    let wal = copied?;
 
     let copy = work.join(file);
     let snapshot = engine::open(&copy)?;
     snapshot.connect()?.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
     drop(snapshot);
-    Ok(std::fs::read(&copy)?)
+    Ok(Snapshot { bytes: std::fs::read(&copy)?, wal })
 }
