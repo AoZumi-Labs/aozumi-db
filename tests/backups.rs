@@ -164,9 +164,13 @@ async fn scheduled_backups_skip_unchanged_databases_and_keep_the_newest() {
     let app = server.database("app").await;
     server.run(Some(&app), vec![execute("CREATE TABLE t (x)")]).await;
 
+    // A tick may land between creating the database and its table, so
+    // there may be one or two backups; after that, nothing while unchanged.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let after_first = list(&server, "app").await;
-    assert_eq!(after_first.len(), 1, "one backup, then nothing while unchanged: {after_first:?}");
+    let settled = list(&server, "app").await;
+    assert!(!settled.is_empty());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(list(&server, "app").await, settled, "no backups while the database is unchanged");
 
     for i in 0..3 {
         server.run(Some(&app), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
