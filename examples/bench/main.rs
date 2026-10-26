@@ -103,6 +103,8 @@ fn main() {
             println!("Open-loop write latency, {} tx/s, {} connections, {}s, {machine}\n", args.rate, args.clients, args.seconds);
             send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await;
             open_loop(&url, args.clients, args.rate, duration).await;
+            let wal = std::fs::metadata(dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
+            println!("\nWAL at the end: {:.1} MB", wal as f64 / 1e6);
         }),
         _ => {
             clients.block_on(micro(&url, args.clients, duration));
@@ -136,8 +138,9 @@ async fn send(client: &HttpClient, url: &str, mut requests: Vec<Value>) {
     let body = json!({"baton": null, "requests": requests}).to_string();
     let request = Request::post(url).body(Full::new(Bytes::from(body))).unwrap();
     let response = client.request(request).await.unwrap();
-    assert!(response.status().is_success(), "HTTP {}", response.status());
+    let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(status.is_success(), "HTTP {status}: {}", String::from_utf8_lossy(&body));
     // An error inside the pipeline would make the numbers meaningless.
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     for result in parsed["results"].as_array().unwrap() {
@@ -287,12 +290,12 @@ async fn micro(url: &str, clients: usize, duration: Duration) {
     })
     .await;
     closed_loop("single-row insert", url, clients, duration, |rng| {
-        ("insert", vec![execute_args("INSERT INTO log (n, body) VALUES (?, 'hello world')", json!([int(rng.gen())]))])
+        ("insert", vec![execute_args("INSERT INTO log (n, body) VALUES (?, 'hello world')", json!([int(rng.gen::<u32>() as u64)]))])
     })
     .await;
     closed_loop("100-row transaction", url, clients.min(8), duration, |rng| {
         let mut requests = vec![execute("BEGIN")];
-        requests.extend((0..100).map(|_| execute_args("INSERT INTO log (n, body) VALUES (?, 'batch row')", json!([int(rng.gen())]))));
+        requests.extend((0..100).map(|_| execute_args("INSERT INTO log (n, body) VALUES (?, 'batch row')", json!([int(rng.gen::<u32>() as u64)]))));
         requests.push(execute("COMMIT"));
         ("txn", requests)
     })

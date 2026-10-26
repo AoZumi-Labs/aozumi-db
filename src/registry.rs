@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::Mutex;
@@ -26,7 +27,42 @@ pub struct OpenDb {
     pub db: Db,
     pub limits: Limits,
     pub page_size: u64,
-    manual_wal: bool,
+    /// Writers take turns here, first come first served, instead of racing
+    /// for the engine's write lock and sleeping in its busy backoff.
+    pub writers: Arc<Mutex<()>>,
+    /// Idle connections, reused instead of opened per request.
+    pub pool: Arc<Pool>,
+}
+
+/// Idle connections of one database, kept per access level. Connections
+/// are expensive to open (every SQL function is registered on each), so
+/// streams return theirs here when they close cleanly.
+#[derive(Default)]
+pub struct Pool {
+    read_write: std::sync::Mutex<Vec<Conn>>,
+    read_only: std::sync::Mutex<Vec<Conn>>,
+}
+
+/// Idle connections kept per database and access level.
+const POOL_SIZE: usize = 32;
+
+impl Pool {
+    fn side(&self, read_only: bool) -> &std::sync::Mutex<Vec<Conn>> {
+        if read_only { &self.read_only } else { &self.read_write }
+    }
+
+    pub fn take(&self, read_only: bool) -> Option<Conn> {
+        self.side(read_only).lock().unwrap().pop()
+    }
+
+    /// Keep a connection for reuse. Only connections in autocommit mode,
+    /// with no state a stream set on them, belong here.
+    pub fn put(&self, conn: Conn, read_only: bool) {
+        let mut idle = self.side(read_only).lock().unwrap();
+        if idle.len() < POOL_SIZE {
+            idle.push(conn);
+        }
+    }
 }
 
 /// A consistent copy of a database, and the WAL position it includes.
@@ -43,20 +79,26 @@ impl OpenDb {
             read_only,
             max_pages: self.limits.max_size_bytes.map(|bytes| (bytes / self.page_size).max(1)),
             statement_timeout: self.limits.max_statement_ms.map(Duration::from_millis),
-            manual_wal: self.manual_wal,
+        }
+    }
+
+    /// A connection for a tenant stream: an idle one if there is one.
+    pub fn checkout(&self, busy_timeout: Duration, read_only: bool) -> Result<Conn, turso_core::LimboError> {
+        match self.pool.take(read_only) {
+            Some(conn) => Ok(conn),
+            None => Conn::open(&self.db, &self.conn_options(busy_timeout, read_only)),
         }
     }
 
     /// Settings for the server's own connections: no tenant limits.
     pub fn internal_options(&self) -> ConnOptions {
-        ConnOptions { manual_wal: self.manual_wal, ..Default::default() }
+        ConnOptions::default()
     }
 }
 
 pub struct Registry {
     dir: PathBuf,
     defaults: Limits,
-    manual_wal: bool,
     open: Mutex<HashMap<String, OpenDb>>,
 }
 
@@ -84,10 +126,37 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Registry {
-    /// With `manual_wal`, no connection checkpoints the WAL on its own
-    /// (see [`ConnOptions::manual_wal`]).
-    pub fn new(dir: PathBuf, defaults: Limits, manual_wal: bool) -> Self {
-        Self { dir, defaults, manual_wal, open: Mutex::new(HashMap::new()) }
+    pub fn new(dir: PathBuf, defaults: Limits) -> Self {
+        Self { dir, defaults, open: Mutex::new(HashMap::new()) }
+    }
+
+    /// Checkpoint every open database whose WAL has grown past
+    /// `threshold` frames: a passive pass that blocks no one, then a short
+    /// truncating one. Skipped for a database when a transaction is in the
+    /// way; the next round tries again. Only for servers without WAL
+    /// shipping, which checkpoints on its own schedule.
+    pub async fn checkpoint_all(&self, threshold: u64) {
+        let open = self.open.lock().await.values().cloned().collect::<Vec<_>>();
+        for db in open {
+            let checkpointed = tokio::task::spawn_blocking(move || {
+                let conn = Conn::open(&db.db, &db.internal_options())?;
+                if conn.wal_position()?.frame < threshold {
+                    return anyhow::Ok(());
+                }
+                conn.checkpoint_passive(None)?;
+                match conn.checkpoint_truncate() {
+                    Ok(_) => Ok(()),
+                    Err(err) if err.downcast_ref::<turso_core::LimboError>().is_some_and(|e| matches!(e, turso_core::LimboError::Busy)) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await;
+            match checkpointed {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!("aozumi-db: checkpoint failed: {err:?}"),
+                Err(err) => eprintln!("aozumi-db: checkpoint task failed: {err:?}"),
+            }
+        }
     }
 
     /// The server's limits with a create request's changes applied.
@@ -179,6 +248,8 @@ impl Registry {
         self.write_limits(name, &limits).await?;
         if let Some(db) = self.open.lock().await.get_mut(name) {
             db.limits = limits;
+            // Idle connections carry the old limits.
+            db.pool = Arc::default();
         }
         Ok(limits)
     }
@@ -269,16 +340,14 @@ impl Registry {
     async fn build(&self, name: &str, limits: Limits) -> anyhow::Result<OpenDb> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path(name);
-        let manual_wal = self.manual_wal;
         tokio::task::spawn_blocking(move || {
             let db = engine::open(&path)?;
-            let options = ConnOptions { manual_wal, ..Default::default() };
-            let result = Conn::open(&db, &options)?.execute("PRAGMA page_size", &[], &[], true)?;
+            let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
             let page_size = match result.rows.first().and_then(|row| row.first()) {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, page_size, manual_wal })
+            Ok(OpenDb { db, limits, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default() })
         })
         .await?
     }

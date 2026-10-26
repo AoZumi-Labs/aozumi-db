@@ -37,6 +37,10 @@ use stream::{Stream, Streams};
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const DEV_DATABASE: &str = "default";
+/// How often the background checkpointer looks, and from what WAL size
+/// (about 4 MB of pages) it checkpoints.
+const CHECKPOINT_EVERY: Duration = Duration::from_millis(250);
+const CHECKPOINT_FRAMES: u64 = 1000;
 /// How long a statement waits for another writer (or a backup) to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -74,25 +78,36 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(
-            config.data_dir,
-            config.default_limits,
-            config.backup.as_ref().is_some_and(|b| b.wal_every.is_some()),
-        ),
+        registry: Registry::new(config.data_dir, config.default_limits),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
     });
-    if let Some(every) = state.backups.wal_every() {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                state.backups.ship_all(&state.registry).await;
-            }
-        });
+    // Exactly one task checkpoints the WAL: the shipper when point-in-time
+    // restore is on, otherwise a background checkpointer.
+    match state.backups.wal_every() {
+        Some(every) => {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    state.backups.ship_all(&state.registry).await;
+                }
+            });
+        }
+        None => {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(CHECKPOINT_EVERY);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    state.registry.checkpoint_all(CHECKPOINT_FRAMES).await;
+                }
+            });
+        }
     }
     if let Some(every) = state.backups.every() {
         let state = state.clone();
@@ -192,6 +207,12 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         },
     };
 
+    // Writers queue in arrival order; reads, and streams already holding a
+    // transaction, go straight through.
+    let turn = match stream.may_write(&msg.requests) && !stream.in_transaction() {
+        true => Some(db.writers.clone().lock_owned().await),
+        false => None,
+    };
     // Statements block on disk and CPU, so they run on the blocking pool.
     let (stream, results) = match tokio::task::spawn_blocking(move || {
         let results = msg.requests.iter().map(|request| stream.handle(request)).collect::<Vec<_>>();
@@ -202,18 +223,23 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         Ok(done) => done,
         Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")),
     };
+    drop(turn);
 
     let baton = match stream.is_closed() {
-        true => None,
+        true => {
+            stream.release();
+            None
+        }
         false => Some(state.streams.park(stream).await),
     };
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
 
 fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result<Stream, Resp> {
-    let conn = engine::Conn::open(&db.db, &db.conn_options(BUSY_TIMEOUT, read_only))
+    let conn = db
+        .checkout(BUSY_TIMEOUT, read_only)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
-    Ok(Stream::new(database.to_string(), read_only, conn))
+    Ok(Stream::new(database.to_string(), read_only, conn, db.pool.clone()))
 }
 
 async fn list_databases(state: &State) -> Resp {

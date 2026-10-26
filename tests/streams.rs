@@ -142,3 +142,36 @@ async fn stored_sql_can_be_executed_by_id_until_closed() {
     assert_eq!(results[2]["response"]["type"], "close_sql");
     assert_eq!(results[3]["type"], "error");
 }
+
+#[tokio::test]
+async fn connection_settings_and_temp_tables_do_not_leak_between_streams() {
+    let server = TestServer::dev().await;
+
+    for _ in 0..3 {
+        let results = server
+            .run(None, vec![
+                execute("PRAGMA foreign_keys"),
+                execute("SELECT count(*) FROM temp.sqlite_schema"),
+                execute("PRAGMA foreign_keys = ON"),
+                execute("CREATE TEMP TABLE scratch (x)"),
+            ])
+            .await;
+        assert_eq!(results[0]["response"]["result"]["rows"][0][0]["value"], "0", "a fresh stream has default settings");
+        assert_eq!(results[1]["response"]["result"]["rows"][0][0]["value"], "0", "and no temporary tables");
+        assert_eq!(results[3]["type"], "ok", "{}", results[3]);
+    }
+}
+
+#[tokio::test]
+async fn the_wal_stays_bounded_without_any_backups() {
+    let server = TestServer::dev().await;
+    server.run(None, vec![execute("CREATE TABLE t (x)")]).await;
+    // One commit per row, about 2,000 WAL frames.
+    let inserts = (0..2000).map(|i| execute(&format!("INSERT INTO t VALUES ({i})"))).collect();
+    server.run(None, inserts).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let wal = std::fs::metadata(server.dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
+    assert!(wal < 4 * 1024 * 1024, "the WAL was checkpointed ({wal} bytes)");
+    assert_eq!(count(&server.run(None, vec![execute("SELECT count(*) FROM t")]).await), "2000");
+}

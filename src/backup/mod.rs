@@ -541,6 +541,8 @@ fn checkpoint(open: &OpenDb, shipped_to: u64) -> anyhow::Result<Checkpoint> {
     if conn.wal_position()?.frame > shipped_to {
         return Ok(Checkpoint::Skipped);
     }
+    // One truncating pass, not passive-then-truncate: the frame count it
+    // reports must cover the whole WAL for the check against `shipped_to`.
     match conn.checkpoint_truncate() {
         Ok(backfilled) => Ok(Checkpoint::Done { backfilled }),
         Err(err) if err.downcast_ref::<turso_core::LimboError>().is_some_and(|e| matches!(e, turso_core::LimboError::Busy)) => {

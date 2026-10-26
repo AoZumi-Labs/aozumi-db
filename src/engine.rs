@@ -2,6 +2,8 @@
 //! connections, and statements run to completion on the calling thread.
 //! Everything here blocks, so callers run it on tokio's blocking pool.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,9 +32,6 @@ pub struct ConnOptions {
     pub max_pages: Option<u64>,
     /// Statements running longer than this are interrupted.
     pub statement_timeout: Option<Duration>,
-    /// Never checkpoint or restart the WAL on commit: the WAL shipper owns
-    /// that, so no frame is overwritten before it has been backed up.
-    pub manual_wal: bool,
 }
 
 /// Where a database's WAL is: which incarnation (bumped each time the WAL
@@ -46,17 +45,26 @@ pub struct WalPosition {
 /// Bytes of one WAL frame header.
 pub const FRAME_HEADER: usize = 24;
 
+/// Compiled statements kept per connection, by SQL text.
+const STATEMENT_CACHE: usize = 64;
+
 pub struct Conn {
     inner: Arc<turso_core::Connection>,
     options: ConnOptions,
+    /// Parsing and planning dominate short queries, so compiled programs
+    /// are kept and wrapped in a fresh statement on each use. (Keeping the
+    /// statements themselves pins an old pager and stalls other writers.)
+    programs: RefCell<HashMap<String, (Arc<turso_core::PreparedProgram>, turso_core::QueryMode)>>,
 }
 
 impl Conn {
     pub fn open(db: &Db, options: &ConnOptions) -> Result<Self, LimboError> {
         let inner = db.connect()?;
-        if options.manual_wal {
-            inner.wal_auto_actions_disable();
-        }
+        // Commits never checkpoint the WAL themselves: a checkpoint inside a
+        // commit stalls every writer queued behind it. The server checkpoints
+        // in the background instead (the WAL shipper does when it is on, so
+        // no frame is folded in before it is backed up).
+        inner.wal_auto_actions_disable();
         inner.set_busy_timeout(options.busy_timeout);
         inner.set_query_only(options.read_only);
         if let Some(timeout) = options.statement_timeout {
@@ -66,7 +74,7 @@ impl Conn {
             // Set by the server, not tenant SQL, which may not change it.
             inner.execute(format!("PRAGMA max_page_count = {pages}"))?;
         }
-        Ok(Self { inner, options: options.clone() })
+        Ok(Self { inner, options: options.clone(), programs: RefCell::new(HashMap::new()) })
     }
 
     pub fn autocommit(&self) -> bool {
@@ -81,10 +89,38 @@ impl Conn {
         named: &[(String, Value)],
         want_rows: bool,
     ) -> Result<StmtResult, Error> {
-        let mut stmt = self.inner.prepare(sql).map_err(|err| self.error(err))?;
         if !positional.is_empty() && !named.is_empty() {
             return Err(Error::new("mixing positional and named arguments is not supported", "ARGS_INVALID"));
         }
+        let mut stmt = self.prepare(sql)?;
+        self.run(&mut stmt, sql, positional, named, want_rows)
+    }
+
+    fn prepare(&self, sql: &str) -> Result<turso_core::Statement, Error> {
+        if let Some((program, mode)) = self.programs.borrow().get(sql) {
+            // A schema change since compiling makes the program stale.
+            if program.is_compatible_with(&self.inner) {
+                let program = turso_core::Program::from_prepared(program.clone(), self.inner.clone());
+                return Ok(turso_core::Statement::new(program, self.inner.get_pager(), *mode, 0));
+            }
+        }
+        let stmt = self.inner.prepare(sql).map_err(|err| self.error(err))?;
+        let mut programs = self.programs.borrow_mut();
+        if programs.len() >= STATEMENT_CACHE {
+            programs.clear();
+        }
+        programs.insert(sql.to_string(), (stmt.get_program().prepared().clone(), stmt.get_query_mode()));
+        Ok(stmt)
+    }
+
+    fn run(
+        &self,
+        stmt: &mut turso_core::Statement,
+        sql: &str,
+        positional: &[Value],
+        named: &[(String, Value)],
+        want_rows: bool,
+    ) -> Result<StmtResult, Error> {
         for (i, value) in positional.iter().enumerate() {
             let index = NonZero::new(i + 1).expect("i + 1 > 0");
             stmt.bind_at(index, to_core(value)).map_err(sql_error)?;
@@ -107,11 +143,14 @@ impl Conn {
             }
         }
 
+        let changes = stmt.n_change().max(0) as u64;
         Ok(StmtResult {
             cols,
             rows,
-            affected_row_count: stmt.n_change().max(0) as u64,
-            last_insert_rowid: Some(self.inner.last_insert_rowid().to_string()),
+            affected_row_count: changes,
+            // Only meaningful when this statement changed rows; otherwise it
+            // would be whatever the connection last inserted.
+            last_insert_rowid: (changes > 0).then(|| self.inner.last_insert_rowid().to_string()),
         })
     }
 
@@ -148,9 +187,17 @@ impl Conn {
         Ok((out, last))
     }
 
-    /// Copy every WAL frame into the database file and empty the WAL.
-    /// Returns how many frames were copied, so the caller can tell whether
-    /// any arrived that it had not seen.
+    /// Copy WAL frames up to `upper_bound` into the database file without
+    /// blocking readers or writers.
+    pub fn checkpoint_passive(&self, upper_bound: Option<u64>) -> anyhow::Result<()> {
+        self.inner.checkpoint(CheckpointMode::Passive { upper_bound_inclusive: upper_bound })?;
+        Ok(())
+    }
+
+    /// Copy every remaining WAL frame into the database file and empty the
+    /// WAL, holding writers off meanwhile. Returns how many frames this
+    /// copied, so the caller can tell whether any arrived that it had not
+    /// seen. Run [`Self::checkpoint_passive`] first to keep this short.
     pub fn checkpoint_truncate(&self) -> anyhow::Result<u64> {
         let result = self.inner.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
         Ok(result.wal_checkpoint_backfilled)

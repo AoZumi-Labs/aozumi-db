@@ -11,6 +11,7 @@ use rand::RngCore;
 use tokio::sync::Mutex;
 
 use crate::engine::Conn;
+use crate::registry::Pool;
 use crate::policy;
 use crate::proto::{
     BatchCond, BatchResult, Error, Stmt, StmtResult, StreamRequest, StreamResponse, StreamResult,
@@ -19,18 +20,56 @@ use crate::proto::{
 pub struct Stream {
     pub db: String,
     pub read_only: bool,
+    pool: Arc<Pool>,
+    /// The stream ran SQL that may leave state on the connection (a pragma
+    /// setting, a temporary table), so it is not reused.
+    dirty: bool,
     conn: Conn,
     sqls: HashMap<i32, String>,
     closed: bool,
 }
 
 impl Stream {
-    pub fn new(db: String, read_only: bool, conn: Conn) -> Self {
-        Self { db, read_only, conn, sqls: HashMap::new(), closed: false }
+    pub fn new(db: String, read_only: bool, conn: Conn, pool: Arc<Pool>) -> Self {
+        Self { db, read_only, pool, dirty: false, conn, sqls: HashMap::new(), closed: false }
+    }
+
+    /// A closed stream hands its connection back for reuse when it is clean.
+    pub fn release(self) {
+        if !self.dirty && self.conn.autocommit() {
+            self.pool.put(self.conn, self.read_only);
+        }
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether running `requests` may write. Errs toward yes: a wrong yes
+    /// costs a short wait in the writer queue, never correctness.
+    pub fn may_write(&self, requests: &[StreamRequest]) -> bool {
+        let stmt_may_write = |stmt: &Stmt| match (&stmt.sql, stmt.sql_id) {
+            (Some(sql), _) => sql_may_write(sql),
+            (None, Some(id)) => self.sqls.get(&id).is_none_or(|sql| sql_may_write(sql)),
+            (None, None) => false,
+        };
+        !self.read_only
+            && requests.iter().any(|request| match request {
+                StreamRequest::Execute { stmt } => stmt_may_write(stmt),
+                StreamRequest::Batch { batch } => batch.steps.iter().any(|step| stmt_may_write(&step.stmt)),
+                StreamRequest::Sequence { sql, sql_id } => match (sql, sql_id) {
+                    (Some(sql), _) => sql_may_write(sql),
+                    (None, Some(id)) => self.sqls.get(id).is_none_or(|sql| sql_may_write(sql)),
+                    (None, None) => false,
+                },
+                _ => false,
+            })
+    }
+
+    /// Inside a transaction, the stream may hold the engine's write lock
+    /// across requests, so it must not queue behind writers waiting for it.
+    pub fn in_transaction(&self) -> bool {
+        !self.conn.autocommit()
     }
 
     /// Blocks: call from the blocking pool.
@@ -72,6 +111,7 @@ impl Stream {
             StreamRequest::Sequence { sql, sql_id } => {
                 let sql = self.sql(sql.as_deref(), *sql_id)?;
                 policy::check(&sql)?;
+                self.dirty |= changes_connection(&sql);
                 self.conn.execute_script(&sql)?;
                 StreamResponse::Sequence
             }
@@ -87,9 +127,10 @@ impl Stream {
         })
     }
 
-    fn execute(&self, stmt: &Stmt) -> Result<StmtResult, Error> {
+    fn execute(&mut self, stmt: &Stmt) -> Result<StmtResult, Error> {
         let sql = self.sql(stmt.sql.as_deref(), stmt.sql_id)?;
         policy::check(&sql)?;
+        self.dirty |= changes_connection(&sql);
         let named = stmt.named_args.iter().map(|a| (a.name.clone(), a.value.clone())).collect::<Vec<_>>();
         self.conn.execute(&sql, &stmt.args, &named, stmt.want_rows.unwrap_or(true))
     }
@@ -163,4 +204,36 @@ impl Streams {
         self.parked.lock().await.insert(baton.clone(), (stream, Instant::now()));
         baton
     }
+}
+
+/// Whether a statement may write, judged from its first keyword.
+fn sql_may_write(sql: &str) -> bool {
+    let mut rest = sql.trim_start();
+    // Skip leading comments.
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+        } else {
+            break;
+        }
+    }
+    let word = rest.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_ascii_uppercase();
+    match word.as_str() {
+        "SELECT" | "VALUES" | "EXPLAIN" | "PRAGMA" | "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => false,
+        "WITH" => {
+            let upper = rest.to_ascii_uppercase();
+            ["INSERT", "UPDATE", "DELETE", "REPLACE"].iter().any(|w| upper.contains(w))
+        }
+        _ => true,
+    }
+}
+
+/// Whether SQL may leave state on its connection: pragma settings and
+/// temporary objects. Errs toward yes; a yes only skips reusing the
+/// connection.
+fn changes_connection(sql: &str) -> bool {
+    let has = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    has(b"pragma") || has(b"temp")
 }
