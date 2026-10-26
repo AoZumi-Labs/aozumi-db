@@ -26,11 +26,15 @@ pub struct ConnOptions {
     pub busy_timeout: Duration,
     /// The engine refuses every write on this connection.
     pub read_only: bool,
+    /// The database may not grow past this many pages.
+    pub max_pages: Option<u64>,
+    /// Statements running longer than this are interrupted.
+    pub statement_timeout: Option<Duration>,
 }
 
 pub struct Conn {
     inner: Arc<turso_core::Connection>,
-    read_only: bool,
+    options: ConnOptions,
 }
 
 impl Conn {
@@ -38,7 +42,14 @@ impl Conn {
         let inner = db.connect()?;
         inner.set_busy_timeout(options.busy_timeout);
         inner.set_query_only(options.read_only);
-        Ok(Self { inner, read_only: options.read_only })
+        if let Some(timeout) = options.statement_timeout {
+            inner.set_query_timeout(timeout);
+        }
+        if let Some(pages) = options.max_pages {
+            // Set by the server, not tenant SQL, which may not change it.
+            inner.execute(format!("PRAGMA max_page_count = {pages}"))?;
+        }
+        Ok(Self { inner, options: options.clone() })
     }
 
     pub fn autocommit(&self) -> bool {
@@ -73,7 +84,7 @@ impl Conn {
             .map(|i| Col { name: Some(stmt.get_column_name(i).into_owned()), decltype: stmt.get_column_decltype(i) })
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        while let Some(row) = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map_err(sql_error)? {
+        while let Some(row) = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map_err(|err| self.error(err))? {
             if want_rows {
                 rows.push(row.get_values().map(from_core).collect());
             }
@@ -93,11 +104,17 @@ impl Conn {
     }
 
     fn error(&self, err: LimboError) -> Error {
-        // The engine reports a write on a query-only connection as a parse
-        // error; clients expect SQLite's READONLY code.
         match &err {
-            LimboError::ParseError(message) if self.read_only && message.contains("query_only") => {
+            // The engine reports a write on a query-only connection as a
+            // parse error; clients expect SQLite's READONLY code.
+            LimboError::ParseError(message) if self.options.read_only && message.contains("query_only") => {
                 Error::new("this token is read-only", "SQLITE_READONLY")
+            }
+            LimboError::DatabaseFull if self.options.max_pages.is_some() => {
+                Error::new("the database has reached its size limit", "SQLITE_FULL")
+            }
+            LimboError::Interrupt if self.options.statement_timeout.is_some() => {
+                Error::new("the statement ran past its time limit and was stopped", "SQLITE_INTERRUPT")
             }
             _ => sql_error(err),
         }

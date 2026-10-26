@@ -4,6 +4,7 @@
 mod auth;
 mod backup;
 mod engine;
+mod limits;
 mod policy;
 mod proto;
 mod registry;
@@ -29,6 +30,8 @@ pub use auth::{mint as mint_token, Claims};
 pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
 use backup::{BackupError, Backups};
 use proto::{PipelineReq, PipelineResp};
+pub use limits::Limits;
+use limits::{LimitsPatch, RateLimiter};
 use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
 
@@ -44,17 +47,26 @@ pub struct Config {
     /// How long a stream may sit unused before it is closed.
     pub stream_idle_timeout: Duration,
     pub backup: Option<BackupConfig>,
+    /// Limits for new databases; each database keeps its own copy.
+    pub default_limits: Limits,
 }
 
 impl Config {
     pub fn new(data_dir: PathBuf, secret: Option<Vec<u8>>) -> Self {
-        Self { data_dir, secret, stream_idle_timeout: Duration::from_secs(10), backup: None }
+        Self {
+            data_dir,
+            secret,
+            stream_idle_timeout: Duration::from_secs(10),
+            backup: None,
+            default_limits: Limits::default(),
+        }
     }
 }
 
 struct State {
     secret: Option<Vec<u8>>,
     registry: Registry,
+    rates: RateLimiter,
     streams: Arc<Streams>,
     backups: Backups,
 }
@@ -62,7 +74,8 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir),
+        registry: Registry::new(config.data_dir, config.default_limits),
+        rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
     });
@@ -107,7 +120,9 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
             match (req.method(), &segments[2..]) {
                 (&Method::GET, []) => list_databases(&state).await,
                 (&Method::POST, []) => create_database(&state, req).await,
+                (&Method::GET, [name]) => database_info(&state, name).await,
                 (&Method::DELETE, [name]) => delete_database(&state, name).await,
+                (&Method::PATCH, [name, "limits"]) => update_limits(&state, name, req).await,
                 (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
                 (&Method::POST, [name, "backups"]) => match state.backups.snapshot(&state.registry, name).await {
                     Ok(info) => json(StatusCode::CREATED, &info),
@@ -134,6 +149,21 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         },
     };
 
+    let db = match state.registry.open(&database, create).await {
+        Ok(db) => db,
+        Err(err) => return registry_error(err),
+    };
+    if let Some(rate) = db.limits.max_requests_per_second {
+        if let Err(wait) = state.rates.check(&database, rate) {
+            let retry_after = wait.as_secs_f64().ceil().max(1.0) as u64;
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", retry_after.to_string())
+                .body(Full::new(Bytes::from("this database is over its request rate limit")))
+                .unwrap();
+        }
+    }
+
     let msg: PipelineReq = match read_json(req).await {
         Ok(msg) => msg,
         Err(resp) => return resp,
@@ -144,7 +174,7 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
             Some(stream) if stream.db == database && stream.read_only == read_only => stream,
             _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
         },
-        None => match open_stream(state, &database, read_only, create).await {
+        None => match open_stream(&database, &db, read_only) {
             Ok(stream) => stream,
             Err(resp) => return resp,
         },
@@ -168,10 +198,8 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
 
-async fn open_stream(state: &State, database: &str, read_only: bool, create: bool) -> Result<Stream, Resp> {
-    let db = state.registry.open(database, create).await.map_err(registry_error)?;
-    let options = engine::ConnOptions { busy_timeout: BUSY_TIMEOUT, read_only };
-    let conn = engine::Conn::open(&db, &options)
+fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result<Stream, Resp> {
+    let conn = engine::Conn::open(&db.db, &db.conn_options(BUSY_TIMEOUT, read_only))
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     Ok(Stream::new(database.to_string(), read_only, conn))
 }
@@ -192,6 +220,8 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
         name: String,
         /// Start from a backup instead of empty.
         restore: Option<Restore>,
+        /// Changes to the server's default limits for this database.
+        limits: Option<LimitsPatch>,
     }
     #[derive(Deserialize)]
     struct Restore {
@@ -202,8 +232,12 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
         Ok(body) => body,
         Err(resp) => return resp,
     };
+    let limits = match state.registry.limits_for_new(body.limits.as_ref()) {
+        Ok(limits) => limits,
+        Err(err) => return registry_error(err),
+    };
     let created = match body.restore {
-        None => state.registry.create(&body.name).await,
+        None => state.registry.create(&body.name, limits).await,
         Some(from) => {
             // Refuse early so a doomed restore does not download a backup.
             match state.registry.open(&body.name, false).await {
@@ -212,7 +246,7 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
                 Err(err) => return registry_error(err),
             }
             match state.backups.fetch(&from.database, &from.backup).await {
-                Ok(bytes) => state.registry.create_from(&body.name, bytes).await,
+                Ok(bytes) => state.registry.create_from(&body.name, bytes, limits).await,
                 Err(err) => return backup_error(err),
             }
         }
@@ -223,10 +257,33 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
     }
 }
 
+async fn database_info(state: &State, name: &str) -> Resp {
+    let db = match state.registry.open(name, false).await {
+        Ok(db) => db,
+        Err(err) => return registry_error(err),
+    };
+    match state.registry.size(name).await {
+        Ok(size_bytes) => json(StatusCode::OK, &json!({"name": name, "size_bytes": size_bytes, "limits": db.limits})),
+        Err(err) => registry_error(err),
+    }
+}
+
+async fn update_limits(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+    let patch: LimitsPatch = match read_json(req).await {
+        Ok(patch) => patch,
+        Err(resp) => return resp,
+    };
+    match state.registry.set_limits(name, &patch).await {
+        Ok(limits) => json(StatusCode::OK, &json!({"name": name, "limits": limits})),
+        Err(err) => registry_error(err),
+    }
+}
+
 async fn delete_database(state: &State, name: &str) -> Resp {
     match state.registry.delete(name).await {
         Ok(()) => {
             state.streams.close_database(name).await;
+            state.rates.forget(name);
             Response::builder().status(StatusCode::NO_CONTENT).body(Full::default()).unwrap()
         }
         Err(err) => registry_error(err),
@@ -281,6 +338,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Re
 fn registry_error(err: RegistryError) -> Resp {
     match err {
         RegistryError::InvalidName => text(StatusCode::BAD_REQUEST, "database names match [a-z0-9][a-z0-9-]{0,62}"),
+        RegistryError::InvalidLimits(message) => text(StatusCode::BAD_REQUEST, &message),
         RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
         RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
         RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),

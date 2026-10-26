@@ -40,6 +40,10 @@ impl TestServer {
         Self::start(Some(SECRET), |_| {}).await
     }
 
+    pub async fn with_secret_and(tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start(Some(SECRET), tweak).await
+    }
+
     pub async fn with_backups(backups: &Backups) -> Self {
         Self::with_backup_target(BackupTarget::directory(backups.dir.clone()), backups.keep, backups.every).await
     }

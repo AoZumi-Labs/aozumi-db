@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config};
+use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config, Limits};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
-  aozumi-db token <database> [ttl]  print a token for <database>, valid for ttl seconds";
+  aozumi-db token <database> [ttl] [--read-only]
+                                    print a token for <database>, valid for ttl seconds";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let read_only = args.iter().any(|a| a == "--read-only");
+    args.retain(|a| a != "--read-only");
     let secret = std::env::var("AOZUMI_DB_SECRET").ok().filter(|s| !s.is_empty()).map(String::into_bytes);
 
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -20,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(ttl) => Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + ttl.parse::<u64>()?),
                 None => None,
             };
-            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), exp, read_only: false }));
+            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), exp, read_only }));
             Ok(())
         }
         _ => {
@@ -39,6 +42,7 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
 
     let mut config = Config::new(data_dir.clone(), secret);
     config.backup = backup_config()?;
+    config.default_limits = default_limits()?;
     if config.backup.is_none() {
         eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");
     }
@@ -71,4 +75,24 @@ fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
         keep: keep.max(1) as usize,
         every: (every > 0).then(|| Duration::from_secs(every)),
     }))
+}
+
+/// Limits for new databases. A 10 s statement limit by default, so one
+/// runaway query cannot hold a thread forever; `0` lifts a limit.
+fn default_limits() -> anyhow::Result<Limits> {
+    let limit = |name: &str, default: Option<u64>| -> anyhow::Result<Option<u64>> {
+        match std::env::var(name) {
+            Ok(value) => match value.parse::<u64>() {
+                Ok(0) => Ok(None),
+                Ok(n) => Ok(Some(n)),
+                Err(_) => anyhow::bail!("{name} must be a whole number, got {value:?}"),
+            },
+            Err(_) => Ok(default),
+        }
+    };
+    Ok(Limits {
+        max_size_bytes: limit("AOZUMI_DB_MAX_SIZE_BYTES", None)?,
+        max_statement_ms: limit("AOZUMI_DB_MAX_STATEMENT_MS", Some(10_000))?,
+        max_requests_per_second: limit("AOZUMI_DB_MAX_REQUESTS_PER_SECOND", None)?.map(|n| n as f64),
+    })
 }
