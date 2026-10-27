@@ -187,7 +187,10 @@ async fn the_console_needs_a_database_token() {
     let (_, schema) = server.request(Method::GET, "/v1/console/schema", Some(&rw), None).await;
     assert_eq!(schema["tables"], json!([]));
     // An expired token is refused.
-    let expired = aozumi_db::mint_token(SECRET.as_bytes(), &aozumi_db::Claims { db: "app".into(), exp: Some(1), read_only: true });
+    let expired = aozumi_db::mint_token(
+        SECRET.as_bytes(),
+        &aozumi_db::Claims { db: "app".into(), exp: Some(1), read_only: true, ..Default::default() },
+    );
     let (status, _) = server.request(Method::GET, "/v1/console/schema", Some(&expired), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

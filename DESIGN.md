@@ -56,6 +56,7 @@ aozumi-db (hyper + tokio)
 | D20 | Pooled connections and cached compiled programs | Opening a connection registers every SQL function; parsing and planning dominate short queries. Statements themselves are not cached: one kept across uses pins an old pager and stalls writers. A stream that ran a pragma or touched `TEMP` does not return its connection. |
 | D21 | Commits never checkpoint; a background task does (passive, then a short truncate) | A checkpoint inside a commit stalls every writer queued behind it. |
 | D22 | A console API (`/v1/console/*`) beside the pipeline, behind the same database tokens | The AOZUMI DB console needs scripts split the way SQLite splits them, each statement's outcome, capped results and a table browser. Doing it here uses the engine's own parser and keeps the control plane a thin, authorized proxy. Its JSON is camelCase, shaped for display (integers as strings, long text and blobs cut down), and never a substitute for the pipeline in apps. A read-write script that destroys data (found in the parse, not the text) runs only when confirmed. |
+| D23 | Tokens carry their database's token generation (claim `gen`, absent = 0). Rotating a database's tokens raises its generation by one, and tokens below it are refused | Tokens are stateless, so a leaked one could only be revoked by deleting its database or by rotating the secret, which breaks every app and the admin API at once. One number per database revokes all of that database's tokens and nothing else. It is checked from memory on every request, before the token counts against the rate limit, and lives in `<name>.tokens.json` beside the database, synced when written. It stays when the database is deleted, so a revoked token never opens a database created later under the same name, while an in-place restore (D12) keeps the current tokens working. Tokens above the current generation pass: only a holder of the secret can mint them. Generations are not in backups yet: a database restored into a new data directory starts again at 0, and its revoked tokens work again until it is rotated past them. |
 
 ## HTTP surface
 
@@ -84,8 +85,9 @@ Backup and limit settings are listed in the README.
 
 1. Done: server, protocol v2, tokens, admin API, tests against the real client.
 2. Done: snapshots to S3 or a directory, retention, point-in-time restore.
-   Next: stream large backups instead of holding them in memory; compression.
-3. Done: read-only tokens, statement policy, size/time/rate limits.
+   Next: stream large backups instead of holding them in memory; compression;
+   token generations kept with the backups (D23).
+3. Done: read-only tokens, revocable tokens (D23), statement policy, size/time/rate limits.
    Next: rows-read and rows-written budgets, metrics.
 4. Done: benchmarks (YCSB, open-loop latency) and the first tuning pass.
    Next: TATP, a quiet machine for publishable numbers, the read path.

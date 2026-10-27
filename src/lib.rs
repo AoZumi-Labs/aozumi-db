@@ -34,6 +34,7 @@ use proto::{PipelineReq, PipelineResp};
 pub use engine::Synchronous;
 pub use limits::Limits;
 use limits::{LimitsPatch, RateLimiter};
+pub use registry::token_generation;
 use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
 
@@ -162,6 +163,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                 (&Method::DELETE, [name]) => delete_database(&state, name).await,
                 (&Method::PATCH, [name, "limits"]) => update_limits(&state, name, req).await,
                 (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
+                (&Method::POST, [name, "tokens", "rotate"]) => rotate_tokens(&state, name).await,
                 (&Method::POST, [name, "backups"]) => match state.backups.snapshot(&state.registry, name).await {
                     Ok(info) => json(StatusCode::CREATED, &info),
                     Err(err) => backup_error(err),
@@ -175,17 +177,21 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
 }
 
 /// The database a request's token opens, and whether the token is
-/// read-only, with the database's request rate counted. Dev mode serves its
-/// one database to anyone.
+/// read-only, with the database's request rate counted. A token from before
+/// the database's last rotation is refused before it counts. Dev mode serves
+/// its one database to anyone.
 async fn token_database(state: &State, req: &Request<Incoming>) -> Result<(String, bool, registry::OpenDb), Resp> {
-    let (database, read_only, create) = match &state.secret {
-        None => (DEV_DATABASE.to_string(), false, true),
+    let (database, read_only, generation, create) = match &state.secret {
+        None => (DEV_DATABASE.to_string(), false, None, true),
         Some(secret) => match bearer(req).and_then(|t| auth::verify(secret, t, unix_now())) {
-            Some(claims) => (claims.db, claims.read_only, false),
+            Some(claims) => (claims.db, claims.read_only, Some(claims.generation), false),
             None => return Err(text(StatusCode::UNAUTHORIZED, "a valid database token is required")),
         },
     };
     let db = state.registry.open(&database, create).await.map_err(registry_error)?;
+    if generation.is_some_and(|minted| minted < db.token_generation) {
+        return Err(text(StatusCode::UNAUTHORIZED, "this database token was revoked; use a newer one"));
+    }
     if let Some(rate) = db.limits.max_requests_per_second {
         if let Err(wait) = state.rates.check(&database, rate) {
             let retry_after = wait.as_secs_f64().ceil().max(1.0) as u64;
@@ -457,7 +463,10 @@ async fn database_info(state: &State, name: &str) -> Resp {
         Err(err) => return registry_error(err),
     };
     match state.registry.size(name).await {
-        Ok(size_bytes) => json(StatusCode::OK, &json!({"name": name, "size_bytes": size_bytes, "limits": db.limits})),
+        Ok(size_bytes) => json(
+            StatusCode::OK,
+            &json!({"name": name, "size_bytes": size_bytes, "limits": db.limits, "token_generation": db.token_generation}),
+        ),
         Err(err) => registry_error(err),
     }
 }
@@ -510,11 +519,33 @@ async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp
         Ok(body) => body,
         Err(resp) => return resp,
     };
-    if let Err(err) = state.registry.open(name, false).await {
-        return registry_error(err);
-    }
-    let claims = Claims { db: name.to_string(), exp: body.ttl_seconds.map(|ttl| unix_now() + ttl), read_only: body.read_only };
+    let db = match state.registry.open(name, false).await {
+        Ok(db) => db,
+        Err(err) => return registry_error(err),
+    };
+    let claims = Claims {
+        db: name.to_string(),
+        generation: db.token_generation,
+        exp: body.ttl_seconds.map(|ttl| unix_now() + ttl),
+        read_only: body.read_only,
+    };
     json(StatusCode::OK, &json!({"token": auth::mint(secret, &claims)}))
+}
+
+/// Revoke every token of a database (`Registry::rotate_tokens`) and drop its
+/// open streams, rolling back their transactions. Tokens minted from now on
+/// carry the new generation.
+async fn rotate_tokens(state: &State, name: &str) -> Resp {
+    if state.secret.is_none() {
+        return text(StatusCode::BAD_REQUEST, "tokens need a secret; dev mode has none");
+    }
+    match state.registry.rotate_tokens(name).await {
+        Ok(generation) => {
+            state.streams.close_database(name).await;
+            json(StatusCode::OK, &json!({"name": name, "token_generation": generation}))
+        }
+        Err(err) => registry_error(err),
+    }
 }
 
 fn is_admin(state: &State, req: &Request<Incoming>) -> bool {

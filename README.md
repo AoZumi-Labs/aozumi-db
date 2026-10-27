@@ -81,6 +81,23 @@ A read-only token can run any query, but every write fails with
 `SQLITE_READONLY`. Give it to dashboards, analytics and anything that should
 never change data.
 
+## Revoking tokens
+
+If a token leaks, rotate its database's tokens. Every token minted for that
+database until now, read-only or not, gets HTTP 401 from then on, and the
+database's open streams are closed. Other databases are not affected.
+
+```bash
+curl -X POST localhost:8080/v1/databases/notes/tokens/rotate -H "authorization: Bearer $AOZUMI_DB_SECRET"
+# {"name": "notes", "token_generation": 1}
+```
+
+Then mint a new token and give it to the app, with
+`POST /v1/databases/notes/tokens` or with `aozumi-db token notes` and the
+server's `AOZUMI_DB_DATA_DIR`. Both mint at the new generation. The generation
+stays when a database is deleted, so a database created again under the same
+name still refuses the revoked tokens.
+
 ## What tenant SQL can do
 
 Each database is isolated from the server and from other databases. Tenant
@@ -167,10 +184,11 @@ restore from.
 | `GET` | `/health` | none | liveness |
 | `GET` | `/v1/databases` | admin | list databases |
 | `POST` | `/v1/databases` | admin | create `{"name"}`, optionally `"limits"` and `"restore": {"database", "backup" or "at"}` |
-| `GET` | `/v1/databases/{name}` | admin | size and limits |
+| `GET` | `/v1/databases/{name}` | admin | size, limits and token generation |
 | `PATCH` | `/v1/databases/{name}/limits` | admin | change limits |
 | `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files |
-| `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` |
+| `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` at the current token generation |
+| `POST` | `/v1/databases/{name}/tokens/rotate` | admin | revoke every token of the database and close its streams → `{"name", "token_generation"}` |
 | `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes"}` |
 | `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, and the point-in-time window |
 | `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
@@ -195,11 +213,14 @@ transactions work through batons. Protocol v3 (cursors, protobuf) and
 
 ```
 adb1.<base64url(JSON claims)>.<base64url(HMAC-SHA256(secret, "adb1.<claims>"))>
-claims: {"db": "notes", "exp": 4102444800, "read_only": true}   // exp and read_only optional
+claims: {"db": "notes", "gen": 2, "exp": 4102444800, "read_only": true}   // gen, exp and read_only optional
 ```
 
 Base64url without padding. Anything that holds the secret can mint tokens,
-so a control plane can create them without calling the server.
+so a control plane can create them without calling the server. `gen` is the
+database's token generation when the token was minted (absent means 0). The
+server refuses tokens below the database's current generation, which
+`GET /v1/databases/{name}` reports as `token_generation`.
 
 ## Tests
 
