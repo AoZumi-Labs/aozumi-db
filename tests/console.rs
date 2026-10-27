@@ -153,6 +153,24 @@ async fn tables_and_pages() {
 }
 
 #[tokio::test]
+async fn the_browser_opens_only_tables_the_database_lists() {
+    let server = TestServer::with_secret().await;
+    let rw = server.database("app").await;
+    run(&server, &rw, "create table notes (body text)").await;
+    let ro = read_only_token(&server, "app").await;
+
+    // Table-valued functions and SQLite's own tables are not tables someone
+    // made; pragma_database_list would show where the file lives on the server.
+    for table in ["pragma_database_list", "pragma_table_list", "sqlite_schema"] {
+        let (status, body) = server.request(Method::POST, "/v1/console/rows", Some(&ro), Some(json!({"table": table}))).await;
+        assert_eq!((status, body["code"].as_str()), (StatusCode::NOT_FOUND, Some("table_not_found")), "{table}: {body}");
+    }
+    // Names match the way SQL matches them, whatever their case.
+    let (status, body) = server.request(Method::POST, "/v1/console/rows", Some(&ro), Some(json!({"table": "NOTES"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn the_console_needs_a_database_token() {
     let server = TestServer::with_secret().await;
     let rw = server.database("app").await;

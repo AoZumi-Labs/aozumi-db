@@ -396,9 +396,14 @@ pub fn is_missing_table(error: &Error) -> bool {
     error.message.contains("no such table")
 }
 
-/// One page of a table, 1-based, and how many rows it has.
+/// One page of a table, 1-based, and how many rows it has. Only a table the
+/// database lists opens, never a table-valued function or SQLite's own
+/// tables; names match as SQL matches them, regardless of ASCII case.
 pub fn page(conn: &Conn, table: &str, page: u64) -> Result<TablePage, Error> {
-    let name = quote_identifier(table);
+    let Some(listed) = tables(conn)?.into_iter().find(|name| name.eq_ignore_ascii_case(table)) else {
+        return Err(Error::new(format!("no such table: {table}"), "SQLITE_ERROR"));
+    };
+    let name = quote_identifier(&listed);
     let mut total = 0;
     conn.execute_each(&format!("SELECT count(*) FROM {name}"), |values| {
         if let Some(Core::Numeric(Numeric::Integer(n))) = values.first() {
