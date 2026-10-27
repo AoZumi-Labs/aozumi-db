@@ -16,9 +16,12 @@ idle database costs nothing, and a new one is ready in milliseconds.
 ## Quick start
 
 ```bash
-cargo run --release
-# aozumi-db: AOZUMI_DB_SECRET is unset, running in dev mode: no auth, one database named `default`
+AOZUMI_DB_DEV=1 cargo run --release
+# aozumi-db: AOZUMI_DB_DEV=1 and no AOZUMI_DB_SECRET, running in dev mode: no auth, one database named `default`
 ```
+
+Dev mode is for your own machine. Without `AOZUMI_DB_DEV=1`, the server
+refuses to start until `AOZUMI_DB_SECRET` is set.
 
 ```js
 import { createClient } from "@libsql/client";
@@ -56,7 +59,8 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 |-----|---------|---------|
 | `AOZUMI_DB_LISTEN` | `127.0.0.1:8080` | Listen address |
 | `AOZUMI_DB_DATA_DIR` | `./data` | Where database files live |
-| `AOZUMI_DB_SECRET` | unset (dev mode) | Signs tokens; also the admin API credential |
+| `AOZUMI_DB_SECRET` | required | Signs tokens; also the admin API credential. Unset or empty, the server does not start |
+| `AOZUMI_DB_DEV` | unset | `1` runs without a secret: no auth, one database named `default` |
 | `AOZUMI_DB_BACKUP_URL` | unset (no backups) | `s3://bucket/prefix` or `file:///path` |
 | `AOZUMI_DB_BACKUP_EVERY` | `300` | Seconds between backups of changed databases; `0` = only on request |
 | `AOZUMI_DB_BACKUP_KEEP` | `24` | Backups kept per database |

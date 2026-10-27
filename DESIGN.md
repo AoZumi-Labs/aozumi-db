@@ -42,7 +42,7 @@ aozumi-db (hyper + tokio)
 | D6 | Batons are random, single-use, and rotated on every request; idle streams close after 10 seconds | Matches libSQL's server. A rotated baton stops two requests from driving one connection at once. |
 | D7 | Error codes use SQLite names (`SQLITE_CONSTRAINT`, ...) | `@libsql/client` passes them through as `LibsqlError.code`, which apps already check. |
 | D8 | Named arguments without a prefix match `:name`, `@name` or `$name` in the SQL | `@libsql/client` sends object keys without the prefix. |
-| D9 | No secret configured = dev mode: no auth, one database named `default` | Local development and tests need no setup. The server logs a warning. |
+| D9 | Dev mode (no auth, one database named `default`) only with `AOZUMI_DB_DEV=1`; otherwise a missing or empty secret stops the server from starting | Local development needs no secret. A secret that never reached the process (a missing line in an env file, an empty value) must not leave every database open, so running without one is something to ask for. |
 | D10 | A backup copies the database and WAL files under `BEGIN IMMEDIATE`, then checkpoints the copy into one file | Writers wait only for a local file copy; readers never wait. The result is one self-contained file. Every connection gets a 5 s busy timeout so writes wait instead of failing. |
 | D11 | Scheduled backups skip databases whose files have not changed (size and mtime) | Idle apps cost nothing, including in backup storage and requests. |
 | D12 | Restores create a new database; they never overwrite a live one | No restore can destroy data. Restoring in place is delete, then create from backup, on purpose. |
@@ -75,7 +75,8 @@ Database names: `[a-z0-9][a-z0-9-]{0,62}`.
 |-----|---------|---------|
 | `AOZUMI_DB_LISTEN` | `127.0.0.1:8080` | Listen address |
 | `AOZUMI_DB_DATA_DIR` | `./data` | Where database files live |
-| `AOZUMI_DB_SECRET` | unset (dev mode) | HMAC key for database tokens and the admin API |
+| `AOZUMI_DB_SECRET` | required | HMAC key for database tokens and the admin API |
+| `AOZUMI_DB_DEV` | unset | `1` = dev mode without a secret (D9) |
 
 Backup and limit settings are listed in the README.
 

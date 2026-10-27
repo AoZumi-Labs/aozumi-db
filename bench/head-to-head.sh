@@ -24,8 +24,8 @@ start() { # name dir
   fi
   case $1 in
     libsql) "$SQLD" --db-path "$2/data.sqld" --http-listen-addr 127.0.0.1:$PORT >"$2/server.log" 2>&1 & ;;
-    aozumi-full) AOZUMI_DB_LISTEN=127.0.0.1:$PORT AOZUMI_DB_DATA_DIR="$2" "$ADB" >"$2/server.log" 2>&1 & ;;
-    aozumi-normal) AOZUMI_DB_SYNCHRONOUS=normal AOZUMI_DB_LISTEN=127.0.0.1:$PORT AOZUMI_DB_DATA_DIR="$2" "$ADB" >"$2/server.log" 2>&1 & ;;
+    aozumi-full) AOZUMI_DB_DEV=1 AOZUMI_DB_LISTEN=127.0.0.1:$PORT AOZUMI_DB_DATA_DIR="$2" "$ADB" >"$2/server.log" 2>&1 & ;;
+    aozumi-normal) AOZUMI_DB_DEV=1 AOZUMI_DB_SYNCHRONOUS=normal AOZUMI_DB_LISTEN=127.0.0.1:$PORT AOZUMI_DB_DATA_DIR="$2" "$ADB" >"$2/server.log" 2>&1 & ;;
   esac
   SERVER=$!
   for _ in $(seq 100); do curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/v2/pipeline" -d '{"baton":null,"requests":[{"type":"close"}]}' && return; sleep 0.1; done
