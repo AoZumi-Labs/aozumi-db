@@ -11,9 +11,14 @@ use subtle::ConstantTimeEq;
 
 const PREFIX: &str = "adb1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Claims {
     pub db: String,
+    /// The database's token generation when the token was minted. Tokens
+    /// below the database's current generation are refused, so rotating it
+    /// revokes every token minted before. Absent means 0.
+    #[serde(rename = "gen", default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
     /// Unix seconds. The token is refused from this second on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
@@ -48,6 +53,10 @@ pub fn verify(secret: &[u8], token: &str, now: u64) -> Option<Claims> {
 /// The admin API takes the secret itself as its bearer credential.
 pub fn is_admin(secret: &[u8], presented: &str) -> bool {
     bool::from(secret.ct_eq(presented.as_bytes()))
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 fn sign(secret: &[u8], payload: &str) -> Vec<u8> {

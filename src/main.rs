@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, BackupConfig, BackupTarget, Claims, Config, Limits, Synchronous};
+use aozumi_db::{mint_token, token_generation, BackupConfig, BackupTarget, Claims, Config, Limits, Synchronous};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
   aozumi-db token <database> [ttl] [--read-only]
-                                    print a token for <database>, valid for ttl seconds";
+                                    print a token for <database>, valid for ttl seconds,
+                                    at the token generation kept in AOZUMI_DB_DATA_DIR";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +28,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(ttl) => Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + ttl.parse::<u64>()?),
                 None => None,
             };
-            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), exp, read_only }));
+            // The server's own record of the generation, so the token is not one it already revoked.
+            let data_dir = PathBuf::from(std::env::var("AOZUMI_DB_DATA_DIR").unwrap_or_else(|_| "./data".into()));
+            let generation = token_generation(&data_dir, db)?;
+            println!("{}", mint_token(&secret, &Claims { db: db.to_string(), generation, exp, read_only }));
             Ok(())
         }
         _ => {

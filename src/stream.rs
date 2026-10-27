@@ -206,7 +206,8 @@ impl Streams {
         (at.elapsed() < self.idle).then_some(stream)
     }
 
-    /// Drop every parked stream of a database that is being deleted.
+    /// Drop every parked stream of a database that is being deleted or whose
+    /// tokens were rotated.
     pub async fn close_database(&self, db: &str) {
         self.parked.lock().await.retain(|_, (stream, _)| stream.db != db);
     }

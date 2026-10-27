@@ -1,13 +1,15 @@
 //! Database name → open database. Each database is one file in the data
 //! directory, opened once and shared by every connection to it, with its
-//! limits beside it in `<name>.db-limits.json`.
+//! limits beside it in `<name>.db-limits.json` and its token generation in
+//! `<name>.tokens.json`, which outlives the database (`rotate_tokens`).
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
@@ -26,6 +28,8 @@ pub struct Fingerprint(Vec<(u64, SystemTime)>);
 pub struct OpenDb {
     pub db: Db,
     pub limits: Limits,
+    /// Tokens minted below this generation are refused (`rotate_tokens`).
+    pub token_generation: u64,
     pub page_size: u64,
     /// Writers take turns here, first come first served, instead of racing
     /// for the engine's write lock and sleeping in its busy backoff.
@@ -257,6 +261,32 @@ impl Registry {
         Ok(limits)
     }
 
+    /// Revoke every token of a database: its token generation goes up by
+    /// one, and tokens minted below it are refused from now on. Deleting a
+    /// database keeps its generation, so a revoked token stays revoked for a
+    /// database created later under the same name, while an in-place restore
+    /// (delete, then create from a backup) keeps the current tokens working.
+    pub async fn rotate_tokens(&self, name: &str) -> Result<u64, RegistryError> {
+        if !valid_name(name) {
+            return Err(RegistryError::InvalidName);
+        }
+        // Held throughout, so no open reads the generation halfway.
+        let mut open = self.open.lock().await;
+        if !tokio::fs::try_exists(self.path(name)).await? {
+            return Err(RegistryError::NotFound);
+        }
+        let generation = self
+            .read_token_generation(name)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("the token generation of {name} cannot go higher"))?;
+        self.write_token_generation(name, generation).await?;
+        if let Some(db) = open.get_mut(name) {
+            db.token_generation = generation;
+        }
+        Ok(generation)
+    }
+
     /// The database's size in bytes (its pages, including those in the WAL).
     pub async fn size(&self, name: &str) -> Result<u64, RegistryError> {
         let db = self.open(name, false).await?;
@@ -271,7 +301,8 @@ impl Registry {
         Ok(pages)
     }
 
-    /// Close and delete a database with its WAL and other side files.
+    /// Close and delete a database with its WAL and other side files. Its
+    /// token generation stays (see `rotate_tokens`).
     pub async fn delete(&self, name: &str) -> Result<(), RegistryError> {
         if !valid_name(name) {
             return Err(RegistryError::InvalidName);
@@ -344,6 +375,7 @@ impl Registry {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path(name);
         let synchronous = self.synchronous;
+        let token_generation = self.read_token_generation(name).await?;
         tokio::task::spawn_blocking(move || {
             let db = engine::open(&path)?;
             let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
@@ -351,7 +383,7 @@ impl Registry {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
+            Ok(OpenDb { db, limits, token_generation, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
         })
         .await?
     }
@@ -363,12 +395,57 @@ impl Registry {
         Ok(())
     }
 
+    async fn read_token_generation(&self, name: &str) -> anyhow::Result<u64> {
+        generation_from(tokio::fs::read(generation_path(&self.dir, name)).await)
+    }
+
+    /// Written like the limits, and synced on both sides of the rename: a
+    /// rotation that a crash undid would let revoked tokens back in.
+    async fn write_token_generation(&self, name: &str, generation: u64) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(&TokenGeneration { generation })?;
+        let (dir, partial, path) = (self.dir.clone(), self.dir.join(format!(".{name}.tokens")), generation_path(&self.dir, name));
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::create(&partial)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&partial, &path)?;
+            std::fs::File::open(&dir)?.sync_all()?;
+            anyhow::Ok(())
+        })
+        .await?
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.db"))
     }
 
     fn limits_path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.db-limits.json"))
+    }
+}
+
+/// A database's token generation as a server with data directory `dir`
+/// keeps it, for minting tokens without the server (`aozumi-db token`).
+pub fn token_generation(dir: &Path, name: &str) -> anyhow::Result<u64> {
+    anyhow::ensure!(valid_name(name), "database names match [a-z0-9][a-z0-9-]{{0,62}}");
+    generation_from(std::fs::read(generation_path(dir, name)))
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenGeneration {
+    generation: u64,
+}
+
+fn generation_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.tokens.json"))
+}
+
+/// The generation in `<name>.tokens.json`: 0 when the database's tokens were never rotated.
+fn generation_from(read: std::io::Result<Vec<u8>>) -> anyhow::Result<u64> {
+    match read {
+        Ok(bytes) => Ok(serde_json::from_slice::<TokenGeneration>(&bytes)?.generation),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
     }
 }
 
