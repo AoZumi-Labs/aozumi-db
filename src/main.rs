@@ -13,7 +13,11 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let read_only = args.iter().any(|a| a == "--read-only");
     args.retain(|a| a != "--read-only");
-    let secret = std::env::var("AOZUMI_DB_SECRET").ok().filter(|s| !s.is_empty()).map(String::into_bytes);
+    let secret = match std::env::var("AOZUMI_DB_SECRET") {
+        Ok(secret) => (!secret.is_empty()).then(|| secret.into_bytes()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("AOZUMI_DB_SECRET must be UTF-8"),
+    };
 
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => serve(secret).await,
@@ -37,7 +41,15 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
     let listen = std::env::var("AOZUMI_DB_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_dir = PathBuf::from(std::env::var("AOZUMI_DB_DATA_DIR").unwrap_or_else(|_| "./data".into()));
     if secret.is_none() {
-        eprintln!("aozumi-db: AOZUMI_DB_SECRET is unset, running in dev mode: no auth, one database named `default`");
+        // Without a secret nothing is checked, so a secret that never reached
+        // the process must stop the server, not open every database.
+        if std::env::var("AOZUMI_DB_DEV").as_deref() != Ok("1") {
+            anyhow::bail!(
+                "AOZUMI_DB_SECRET is unset or empty. Set it (for example to `openssl rand -hex 32`), \
+                 or set AOZUMI_DB_DEV=1 for dev mode: no auth, one database named `default`"
+            );
+        }
+        eprintln!("aozumi-db: AOZUMI_DB_DEV=1 and no AOZUMI_DB_SECRET, running in dev mode: no auth, one database named `default`");
     }
 
     let mut config = Config::new(data_dir.clone(), secret);
