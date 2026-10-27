@@ -118,6 +118,24 @@ async fn restore_refuses_bad_requests() {
 }
 
 #[tokio::test]
+async fn restore_reads_only_from_the_backup_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Backups { dir: dir.path().join("store"), keep: 10, every: None, wal: None };
+    let server = TestServer::with_backups(&cfg).await;
+    server.database("app").await;
+    let id = snapshot(&server, "app").await["id"].as_str().unwrap().to_string();
+    // A valid backup file beside the store, not in it.
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::copy(cfg.dir.join("app").join(format!("{id}.db")), outside.join(format!("{id}.db"))).unwrap();
+
+    for source in ["../outside", outside.to_str().unwrap()] {
+        let (status, body) = restore(&server, "copy", source, &id).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{source}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn backups_taken_during_writes_are_consistent_and_writes_do_not_fail() {
     let (_dir, cfg) = backups(100, None);
     let server = std::sync::Arc::new(TestServer::with_backups(&cfg).await);

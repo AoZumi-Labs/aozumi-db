@@ -299,6 +299,10 @@ impl Backups {
 
     /// The bytes of a snapshot; `id` may be `latest`.
     pub async fn fetch(&self, db: &str, id: &str) -> Result<Vec<u8>, BackupError> {
+        // The name becomes part of a path in the store; checked before any read.
+        if !crate::registry::valid_name(db) {
+            return Err(RegistryError::InvalidName.into());
+        }
         let target = &self.config()?.target;
         let id = match id {
             "latest" => self.list(db).await?.into_iter().next().ok_or(BackupError::NotFound)?.id,
