@@ -217,4 +217,6 @@ See [DESIGN.md](DESIGN.md) for the decisions and the roadmap.
 
 ## License
 
-MIT.
+MIT, see [LICENSE](LICENSE). The storage engine aozumi-db builds on is MIT
+too; its license and the other third-party notices are in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
