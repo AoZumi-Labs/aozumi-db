@@ -149,7 +149,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
         (&Method::GET, ["v2"]) => json(StatusCode::OK, &json!({})),
         (&Method::POST, ["v2", "pipeline"]) => pipeline(&state, req).await,
         (&Method::POST, ["v1", "console", "run"]) => console_run(&state, req).await,
-        (&Method::GET, ["v1", "console", "tables"]) => console_tables(&state, req).await,
+        (&Method::GET, ["v1", "console", "schema"]) => console_schema(&state, req).await,
         (&Method::POST, ["v1", "console", "rows"]) => console_rows(&state, req).await,
         (_, ["v1", "databases", ..]) => {
             if !is_admin(&state, &req) {
@@ -249,11 +249,16 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
 
-/// The console runs a script: `{"sql": "..."}` (see src/console.rs).
+/// The console runs a script: `{"sql": "...", "confirm_destructive"?: bool}`
+/// (see src/console.rs). With writes allowed, a script that destroys data
+/// runs only when confirmed; otherwise 409 `confirm_destructive` lists what it
+/// would destroy and nothing runs.
 async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     #[derive(Deserialize)]
     struct Body {
         sql: String,
+        #[serde(default)]
+        confirm_destructive: bool,
     }
     let (database, read_only, db) = match token_database(state, &req).await {
         Ok(found) => found,
@@ -272,6 +277,15 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     }
     if split.len() > console::MAX_STATEMENTS {
         return console_error(StatusCode::BAD_REQUEST, &format!("Run at most {} statements at a time.", console::MAX_STATEMENTS), "too_many_statements");
+    }
+    if !read_only && !body.confirm_destructive {
+        let destructive = console::destructive(&split);
+        if !destructive.is_empty() {
+            return json(
+                StatusCode::CONFLICT,
+                &json!({"error": "This script destroys data. Confirm it to run it.", "code": "confirm_destructive", "destructive": destructive}),
+            );
+        }
     }
     let mut stream = match open_stream(&database, &db, read_only) {
         Ok(stream) => stream,
@@ -299,13 +313,13 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     json(StatusCode::OK, &console::RunResult { read_only, duration_ms, statements })
 }
 
-/// The console's table list: `{"tables": [...]}`.
-async fn console_tables(state: &State, req: Request<Incoming>) -> Resp {
+/// The console's schema: `{"tables": [{"name", "columns": [...]}]}`.
+async fn console_schema(state: &State, req: Request<Incoming>) -> Resp {
     let (_, _, db) = match token_database(state, &req).await {
         Ok(found) => found,
         Err(resp) => return resp,
     };
-    match console_read(db, console::tables).await {
+    match console_read(db, console::schema).await {
         Ok(tables) => json(StatusCode::OK, &json!({"tables": tables})),
         Err(resp) => resp,
     }

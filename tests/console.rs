@@ -122,9 +122,15 @@ async fn tables_and_pages() {
         insert into notes (body) select 'note ' || value from generate_series(1, 120);").await;
     let ro = read_only_token(&server, "app").await;
 
-    let (status, tables) = server.request(Method::GET, "/v1/console/tables", Some(&ro), None).await;
-    assert_eq!(status, StatusCode::OK, "{tables}");
-    assert_eq!(tables["tables"], json!(["notes", "we\"ird name"]), "sqlite_sequence is SQLite's own");
+    let (status, schema) = server.request(Method::GET, "/v1/console/schema", Some(&ro), None).await;
+    assert_eq!(status, StatusCode::OK, "{schema}");
+    let names = schema["tables"].as_array().unwrap().iter().map(|table| table["name"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(names, ["notes", "we\"ird name"], "SQLite's and the engine's own tables are left out");
+    assert_eq!(schema["tables"][0]["columns"], json!([
+        {"name": "id", "type": "integer", "notNull": false, "primaryKey": true},
+        {"name": "body", "type": "text", "notNull": false, "primaryKey": false},
+    ]));
+    assert_eq!(schema["tables"][1]["columns"][0]["name"], "x");
 
     let (status, page) = server.request(Method::POST, "/v1/console/rows", Some(&ro), Some(json!({"table": "notes", "page": 3}))).await;
     assert_eq!(status, StatusCode::OK, "{page}");
@@ -153,18 +159,18 @@ async fn the_console_needs_a_database_token() {
     let other = server.database("other").await;
     run(&server, &other, "create table secret (x)").await;
 
-    for (token, path) in [(None, "/v1/console/tables"), (Some(SECRET), "/v1/console/tables"), (Some("adb1.e30.AAAA"), "/v1/console/tables")] {
+    for (token, path) in [(None, "/v1/console/schema"), (Some(SECRET), "/v1/console/schema"), (Some("adb1.e30.AAAA"), "/v1/console/schema")] {
         let (status, _) = server.request(Method::GET, path, token, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?}");
     }
     let (status, _) = server.request(Method::POST, "/v1/console/run", None, Some(json!({"sql": "select 1"}))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     // A token opens its own database and no other.
-    let (_, tables) = server.request(Method::GET, "/v1/console/tables", Some(&rw), None).await;
-    assert_eq!(tables["tables"], json!([]));
+    let (_, schema) = server.request(Method::GET, "/v1/console/schema", Some(&rw), None).await;
+    assert_eq!(schema["tables"], json!([]));
     // An expired token is refused.
     let expired = aozumi_db::mint_token(SECRET.as_bytes(), &aozumi_db::Claims { db: "app".into(), exp: Some(1), read_only: true });
-    let (status, _) = server.request(Method::GET, "/v1/console/tables", Some(&expired), None).await;
+    let (status, _) = server.request(Method::GET, "/v1/console/schema", Some(&expired), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -180,4 +186,31 @@ async fn empty_and_oversized_scripts_are_refused() {
         let (got, body) = server.request(Method::POST, "/v1/console/run", Some(&rw), Some(json!({"sql": sql}))).await;
         assert_eq!((got, body["code"].as_str()), (status, Some(code)), "{body}");
     }
+}
+
+#[tokio::test]
+async fn a_script_that_destroys_data_runs_only_when_confirmed() {
+    let server = TestServer::with_secret().await;
+    let rw = server.database("app").await;
+    run(&server, &rw, "create table notes (x); insert into notes values (1)").await;
+    let script = json!({"sql": "insert into notes values (2); drop table notes"});
+
+    let (status, body) = server.request(Method::POST, "/v1/console/run", Some(&rw), Some(script.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "confirm_destructive");
+    assert_eq!(body["destructive"], json!([{"sql": "drop table notes", "what": "drops the table notes"}]));
+    assert_eq!(run(&server, &rw, "select count(*) from notes").await["statements"][0]["rows"][0][0]["value"], "1", "nothing ran");
+
+    // Read-only, nothing can be destroyed, so nothing is asked.
+    let ro = read_only_token(&server, "app").await;
+    let (status, body) = server.request(Method::POST, "/v1/console/run", Some(&ro), Some(script)).await;
+    assert_eq!((status, body["statements"][0]["error"]["code"].as_str()), (StatusCode::OK, Some("SQLITE_READONLY")));
+
+    let (status, body) = server
+        .request(Method::POST, "/v1/console/run", Some(&rw), Some(json!({"sql": "insert into notes values (2); drop table notes", "confirm_destructive": true})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(states(&body), ["ok", "ok"]);
+    let (_, schema) = server.request(Method::GET, "/v1/console/schema", Some(&rw), None).await;
+    assert_eq!(schema["tables"], json!([]));
 }

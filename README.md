@@ -169,15 +169,18 @@ restore from.
 | `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` |
 | `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes"}` |
 | `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, and the point-in-time window |
-| `POST` | `/v1/console/run` | database token | `{"sql"}`: run a script statement by statement for the AOZUMI DB console |
-| `GET` | `/v1/console/tables` | database token | the database's tables |
+| `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
+| `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |
 
 The console endpoints are for people reading results, not for apps: a script
 is split by the engine's own parser, statements run in order and the first
 error stops the rest, a transaction left open is rolled back, and each
 statement keeps at most 1,000 rows (4 MB across a request) while counting
-them all. A read-only token reads only, as everywhere.
+them all. A read-only token reads only, as everywhere. With a read-write
+token, a script that drops a table, index, view, trigger or column, or deletes
+or updates every row of a table, answers 409 `confirm_destructive` with what it
+would destroy, and runs only when sent again with `"confirm_destructive": true`.
 
 Supported pipeline requests: `execute`, `batch` (with conditions), `sequence`,
 `store_sql`, `close_sql`, `get_autocommit`, `close`. Interactive

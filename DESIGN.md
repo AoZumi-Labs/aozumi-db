@@ -55,7 +55,7 @@ aozumi-db (hyper + tokio)
 | D19 | Writers queue per database (fair, first come first served); reads never wait | The engine's busy handler sleeps up to 100 ms per retry, which put write tails in seconds under contention. Streams inside a transaction skip the queue so they can always reach their `COMMIT`. |
 | D20 | Pooled connections and cached compiled programs | Opening a connection registers every SQL function; parsing and planning dominate short queries. Statements themselves are not cached: one kept across uses pins an old pager and stalls writers. A stream that ran a pragma or touched `TEMP` does not return its connection. |
 | D21 | Commits never checkpoint; a background task does (passive, then a short truncate) | A checkpoint inside a commit stalls every writer queued behind it. |
-| D22 | A console API (`/v1/console/*`) beside the pipeline, behind the same database tokens | The AOZUMI DB console needs scripts split the way SQLite splits them, each statement's outcome, capped results and a table browser. Doing it here uses the engine's own parser and keeps the control plane a thin, authorized proxy. Its JSON is camelCase, shaped for display (integers as strings, long text and blobs cut down), and never a substitute for the pipeline in apps. |
+| D22 | A console API (`/v1/console/*`) beside the pipeline, behind the same database tokens | The AOZUMI DB console needs scripts split the way SQLite splits them, each statement's outcome, capped results and a table browser. Doing it here uses the engine's own parser and keeps the control plane a thin, authorized proxy. Its JSON is camelCase, shaped for display (integers as strings, long text and blobs cut down), and never a substitute for the pipeline in apps. A read-write script that destroys data (found in the parse, not the text) runs only when confirmed. |
 
 ## HTTP surface
 
@@ -63,7 +63,7 @@ aozumi-db (hyper + tokio)
 - `GET /v2`: version check, 200
 - `POST /v2/pipeline`: Hrana v2 pipeline (`execute`, `batch`, `sequence`,
   `store_sql`, `close_sql`, `get_autocommit`, `close`)
-- `POST /v1/console/run`, `GET /v1/console/tables`, `POST /v1/console/rows`:
+- `POST /v1/console/run`, `GET /v1/console/schema`, `POST /v1/console/rows`:
   the console API (D22), database token
 - Admin, `Authorization: Bearer <admin secret>`: see the API table in the README.
 

@@ -13,7 +13,9 @@
 
 use serde::Serialize;
 use turso_core::{Dialect, Numeric, SqliteDialect, Value as Core};
+use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
 use turso_parser::lexer::Lexer;
+use turso_parser::parser::Parser;
 use turso_parser::token::TokenType;
 
 use crate::engine::{sql_error, Conn};
@@ -28,6 +30,8 @@ pub const MAX_STATEMENTS: usize = 50;
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 /// Rows in one page of the table browser.
 pub const PAGE_SIZE: u64 = 50;
+/// Tables described by the schema endpoint; a database with more lists these.
+pub const MAX_SCHEMA_TABLES: usize = 500;
 /// Pages past this are refused, so an offset can never overflow.
 pub const MAX_PAGE: u64 = 1_000_000;
 const MAX_TEXT_CHARS: usize = 10_000;
@@ -121,6 +125,31 @@ pub struct TablePage {
     pub rows: Vec<Vec<Option<Cell>>>,
 }
 
+/// A column as the console's schema panel shows it (`PRAGMA table_info`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Column {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub decl_type: String,
+    pub not_null: bool,
+    pub primary_key: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TableSchema {
+    pub name: String,
+    pub columns: Vec<Column>,
+}
+
+/// A statement that destroys data, with what it does in words. With writes
+/// allowed, the console runs a script holding one only once it is confirmed.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Destructive {
+    pub sql: String,
+    pub what: String,
+}
+
 /// A script cut into statements. When one does not parse, the statements
 /// before it are kept and the rest of the script carries the error, so those
 /// still run and the error lands where it belongs.
@@ -189,6 +218,34 @@ fn statement_text(piece: &str) -> &str {
         }
     }
     start.map_or("", |start| &piece[start..end])
+}
+
+/// The statements of a script that drop a table, index, view, trigger or
+/// column, or delete or change every row of a table (no `WHERE`), read from
+/// the parsed statement rather than guessed from its text. `EXPLAIN` of one
+/// runs nothing, so it is not one.
+pub fn destructive(split: &Split) -> Vec<Destructive> {
+    split
+        .statements
+        .iter()
+        .filter_map(|sql| {
+            let Some(Ok(Cmd::Stmt(stmt))) = Parser::new(sql.as_bytes()).next() else { return None };
+            let what = match &stmt {
+                Stmt::DropTable { tbl_name, .. } => format!("drops the table {}", tbl_name.name.as_str()),
+                Stmt::DropIndex { idx_name, .. } => format!("drops the index {}", idx_name.name.as_str()),
+                Stmt::DropView { view_name, .. } => format!("drops the view {}", view_name.name.as_str()),
+                Stmt::DropTrigger { trigger_name, .. } => format!("drops the trigger {}", trigger_name.name.as_str()),
+                Stmt::Delete { tbl_name, where_clause: None, .. } => format!("deletes every row of {}", tbl_name.name.as_str()),
+                Stmt::Update(update) if update.where_clause.is_none() => format!("changes every row of {}", update.tbl_name.name.as_str()),
+                Stmt::AlterTable(alter) => match &alter.body {
+                    AlterTableBody::DropColumn(column) => format!("drops the column {} of {}", column.as_str(), alter.name.name.as_str()),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(Destructive { sql: sql.clone(), what })
+        })
+        .collect()
 }
 
 /// Runs a script's statements in order on `conn`; the first error stops the
@@ -306,6 +363,24 @@ pub fn tables(conn: &Conn) -> Result<Vec<String>, Error> {
     Ok(names)
 }
 
+/// Every table (up to MAX_SCHEMA_TABLES) with its columns.
+pub fn schema(conn: &Conn) -> Result<Vec<TableSchema>, Error> {
+    tables(conn)?
+        .into_iter()
+        .take(MAX_SCHEMA_TABLES)
+        .map(|name| {
+            let mut columns = Vec::new();
+            // Rows are cid, name, type, notnull, dflt_value, pk.
+            conn.execute_each(&format!("PRAGMA table_info({})", quote_identifier(&name)), |values| {
+                let text = |i: usize| values.get(i).and_then(|value| value.to_text()).unwrap_or_default().to_string();
+                let set = |i: usize| matches!(values.get(i), Some(Core::Numeric(Numeric::Integer(n))) if *n != 0);
+                columns.push(Column { name: text(1), decl_type: text(2), not_null: set(3), primary_key: set(5) });
+            })?;
+            Ok(TableSchema { name, columns })
+        })
+        .collect()
+}
+
 /// A table name the browser may ask for: 1 to 256 characters, no control characters.
 pub fn valid_table_name(name: &str) -> bool {
     (1..=256).contains(&name.chars().count()) && !name.chars().any(char::is_control)
@@ -371,6 +446,22 @@ mod tests {
         let (rest, error) = split.unparsed.unwrap();
         assert!(rest.starts_with("selec 2"), "{rest}");
         assert_eq!(error.code.as_deref(), Some("SQLITE_ERROR"));
+    }
+
+    #[test]
+    fn destructive_statements_are_read_from_the_parse() {
+        let found = destructive(&split("select 1; drop table notes; delete from people; delete from people where id = 1;
+            update people set name = 'x'; update people set name = 'x' where id = 2; alter table people drop column email;
+            alter table people add column age integer; drop index if exists people_name; explain drop table notes"));
+        let what = found.iter().map(|item| item.what.as_str()).collect::<Vec<_>>();
+        assert_eq!(what, [
+            "drops the table notes",
+            "deletes every row of people",
+            "changes every row of people",
+            "drops the column email of people",
+            "drops the index people_name",
+        ]);
+        assert_eq!(found[1].sql, "delete from people");
     }
 
     #[test]
