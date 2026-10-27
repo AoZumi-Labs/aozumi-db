@@ -3,6 +3,7 @@
 
 mod auth;
 mod backup;
+mod console;
 mod engine;
 mod limits;
 mod policy;
@@ -13,7 +14,7 @@ mod stream;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -147,6 +148,9 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
         (&Method::GET, ["health"]) => json(StatusCode::OK, &"ok"),
         (&Method::GET, ["v2"]) => json(StatusCode::OK, &json!({})),
         (&Method::POST, ["v2", "pipeline"]) => pipeline(&state, req).await,
+        (&Method::POST, ["v1", "console", "run"]) => console_run(&state, req).await,
+        (&Method::GET, ["v1", "console", "tables"]) => console_tables(&state, req).await,
+        (&Method::POST, ["v1", "console", "rows"]) => console_rows(&state, req).await,
         (_, ["v1", "databases", ..]) => {
             if !is_admin(&state, &req) {
                 return text(StatusCode::UNAUTHORIZED, "admin credentials required");
@@ -170,30 +174,36 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
     }
 }
 
-async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
-    // Dev mode serves one database to anyone; otherwise the token names it.
+/// The database a request's token opens, and whether the token is
+/// read-only, with the database's request rate counted. Dev mode serves its
+/// one database to anyone.
+async fn token_database(state: &State, req: &Request<Incoming>) -> Result<(String, bool, registry::OpenDb), Resp> {
     let (database, read_only, create) = match &state.secret {
         None => (DEV_DATABASE.to_string(), false, true),
-        Some(secret) => match bearer(&req).and_then(|t| auth::verify(secret, t, unix_now())) {
+        Some(secret) => match bearer(req).and_then(|t| auth::verify(secret, t, unix_now())) {
             Some(claims) => (claims.db, claims.read_only, false),
-            None => return text(StatusCode::UNAUTHORIZED, "a valid database token is required"),
+            None => return Err(text(StatusCode::UNAUTHORIZED, "a valid database token is required")),
         },
     };
-
-    let db = match state.registry.open(&database, create).await {
-        Ok(db) => db,
-        Err(err) => return registry_error(err),
-    };
+    let db = state.registry.open(&database, create).await.map_err(registry_error)?;
     if let Some(rate) = db.limits.max_requests_per_second {
         if let Err(wait) = state.rates.check(&database, rate) {
             let retry_after = wait.as_secs_f64().ceil().max(1.0) as u64;
-            return Response::builder()
+            return Err(Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("retry-after", retry_after.to_string())
                 .body(Full::new(Bytes::from("this database is over its request rate limit")))
-                .unwrap();
+                .unwrap());
         }
     }
+    Ok((database, read_only, db))
+}
+
+async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
+    let (database, read_only, db) = match token_database(state, &req).await {
+        Ok(found) => found,
+        Err(resp) => return resp,
+    };
 
     let msg: PipelineReq = match read_json(req).await {
         Ok(msg) => msg,
@@ -237,6 +247,116 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         false => Some(state.streams.park(stream).await),
     };
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
+}
+
+/// The console runs a script: `{"sql": "..."}` (see src/console.rs).
+async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
+    #[derive(Deserialize)]
+    struct Body {
+        sql: String,
+    }
+    let (database, read_only, db) = match token_database(state, &req).await {
+        Ok(found) => found,
+        Err(resp) => return resp,
+    };
+    let body: Body = match read_json(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    if body.sql.len() > console::MAX_SCRIPT_BYTES {
+        return console_error(StatusCode::PAYLOAD_TOO_LARGE, &format!("Keep a script under {} KB.", console::MAX_SCRIPT_BYTES / 1024), "sql_too_long");
+    }
+    let split = console::split(&body.sql);
+    if split.is_empty() {
+        return console_error(StatusCode::BAD_REQUEST, "There is no SQL to run.", "empty");
+    }
+    if split.len() > console::MAX_STATEMENTS {
+        return console_error(StatusCode::BAD_REQUEST, &format!("Run at most {} statements at a time.", console::MAX_STATEMENTS), "too_many_statements");
+    }
+    let mut stream = match open_stream(&database, &db, read_only) {
+        Ok(stream) => stream,
+        Err(resp) => return resp,
+    };
+    // A read-write console request takes its turn with the app's writers,
+    // whatever its SQL: the person asked to write.
+    let turn = match read_only {
+        false => Some(db.writers.clone().lock_owned().await),
+        true => None,
+    };
+    let started = Instant::now();
+    let (stream, statements) = match tokio::task::spawn_blocking(move || {
+        let statements = stream.run_console(split);
+        (stream, statements)
+    })
+    .await
+    {
+        Ok(done) => done,
+        Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")),
+    };
+    drop(turn);
+    stream.release();
+    let duration_ms = started.elapsed().as_millis() as u64;
+    json(StatusCode::OK, &console::RunResult { read_only, duration_ms, statements })
+}
+
+/// The console's table list: `{"tables": [...]}`.
+async fn console_tables(state: &State, req: Request<Incoming>) -> Resp {
+    let (_, _, db) = match token_database(state, &req).await {
+        Ok(found) => found,
+        Err(resp) => return resp,
+    };
+    match console_read(db, console::tables).await {
+        Ok(tables) => json(StatusCode::OK, &json!({"tables": tables})),
+        Err(resp) => resp,
+    }
+}
+
+/// One page of a table for the console: `{"table": "...", "page": 1}`.
+async fn console_rows(state: &State, req: Request<Incoming>) -> Resp {
+    #[derive(Deserialize)]
+    struct Body {
+        table: String,
+        page: Option<u64>,
+    }
+    let (_, _, db) = match token_database(state, &req).await {
+        Ok(found) => found,
+        Err(resp) => return resp,
+    };
+    let body: Body = match read_json(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    if !console::valid_table_name(&body.table) {
+        return console_error(StatusCode::BAD_REQUEST, "Name a table.", "table_invalid");
+    }
+    let page = body.page.unwrap_or(1).clamp(1, console::MAX_PAGE);
+    match console_read(db, move |conn: &engine::Conn| console::page(conn, &body.table, page)).await {
+        Ok(page) => json(StatusCode::OK, &page),
+        Err(resp) => resp,
+    }
+}
+
+/// Runs a console lookup on a read-only connection, whatever the token
+/// allows: the lookups only read. A missing table answers 404.
+async fn console_read<T: Send + 'static>(
+    db: registry::OpenDb,
+    read: impl FnOnce(&engine::Conn) -> Result<T, proto::Error> + Send + 'static,
+) -> Result<T, Resp> {
+    let conn = db
+        .checkout(BUSY_TIMEOUT, true)
+        .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
+    let pool = db.pool.clone();
+    let (conn, result) = tokio::task::spawn_blocking(move || {
+        let result = read(&conn);
+        (conn, result)
+    })
+    .await
+    .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")))?;
+    pool.put(conn, true);
+    result.map_err(|error| match console::is_missing_table(&error) {
+        true => console_error(StatusCode::NOT_FOUND, "That table is not in this database.", "table_not_found"),
+        false => console_error(StatusCode::UNPROCESSABLE_ENTITY, &error.message, error.code.as_deref().unwrap_or("SQLITE_ERROR")),
+    })
 }
 
 fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result<Stream, Resp> {
@@ -436,6 +556,11 @@ fn json<T: serde::Serialize>(status: StatusCode, body: &T) -> Resp {
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(serde_json::to_vec(body).unwrap())))
         .unwrap()
+}
+
+/// A console error: `{"error": "...", "code": "..."}`.
+fn console_error(status: StatusCode, message: &str, code: &str) -> Resp {
+    json(status, &json!({"error": message, "code": code}))
 }
 
 fn text(status: StatusCode, body: &str) -> Resp {

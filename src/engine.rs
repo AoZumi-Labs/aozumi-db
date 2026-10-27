@@ -61,6 +61,13 @@ pub const FRAME_HEADER: usize = 24;
 /// Compiled statements kept per connection, by SQL text.
 const STATEMENT_CACHE: usize = 64;
 
+/// What [`Conn::execute_each`] reports once a statement has run.
+pub struct Stepped {
+    pub columns: Vec<String>,
+    pub affected_row_count: u64,
+    pub last_insert_rowid: Option<String>,
+}
+
 pub struct Conn {
     inner: Arc<turso_core::Connection>,
     options: ConnOptions,
@@ -166,6 +173,24 @@ impl Conn {
             affected_row_count: changes,
             // Only meaningful when this statement changed rows; otherwise it
             // would be whatever the connection last inserted.
+            last_insert_rowid: (changes > 0).then(|| self.inner.last_insert_rowid().to_string()),
+        })
+    }
+
+    /// Run one statement to completion, handing each row's values to
+    /// `on_row` instead of keeping them, so the caller decides what to keep
+    /// (the console keeps a capped preview). Returns the column names, the
+    /// rows changed and the last inserted rowid as [`Self::execute`] does.
+    pub fn execute_each(&self, sql: &str, mut on_row: impl FnMut(&[&Core])) -> Result<Stepped, Error> {
+        let mut stmt = self.prepare(sql)?;
+        let columns = (0..stmt.num_columns()).map(|i| stmt.get_column_name(i).into_owned()).collect::<Vec<_>>();
+        while let Some(row) = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map_err(|err| self.error(err))? {
+            on_row(&row.get_values().collect::<Vec<_>>());
+        }
+        let changes = stmt.n_change().max(0) as u64;
+        Ok(Stepped {
+            columns,
+            affected_row_count: changes,
             last_insert_rowid: (changes > 0).then(|| self.inner.last_insert_rowid().to_string()),
         })
     }

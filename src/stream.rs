@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use rand::RngCore;
 use tokio::sync::Mutex;
 
+use crate::console;
 use crate::engine::Conn;
 use crate::registry::Pool;
 use crate::policy;
@@ -64,6 +65,20 @@ impl Stream {
                 },
                 _ => false,
             })
+    }
+
+    /// Runs a console script (src/console.rs) on this stream's connection,
+    /// then closes the stream, rolling back any transaction the script left
+    /// open: a console request never holds one past its response.
+    pub fn run_console(&mut self, split: console::Split) -> Vec<console::Outcome> {
+        self.dirty |= split.texts().any(changes_connection);
+        let outcomes = console::run(&self.conn, split);
+        // A failed rollback leaves the transaction open, and `release` then drops the connection.
+        if !self.conn.autocommit() {
+            let _ = self.conn.execute_script("ROLLBACK");
+        }
+        self.closed = true;
+        outcomes
     }
 
     /// Inside a transaction, the stream may hold the engine's write lock
