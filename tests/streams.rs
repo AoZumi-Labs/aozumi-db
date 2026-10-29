@@ -80,6 +80,27 @@ async fn an_idle_stream_expires_and_its_transaction_rolls_back() {
 }
 
 #[tokio::test]
+async fn a_stream_that_expires_before_its_response_returns_no_baton() {
+    // A request looks at its database again after parking its stream, and
+    // can wait for a busy registry longer than the idle timeout. A timeout of
+    // zero makes every stream expire in that gap.
+    let server = TestServer::dev_with_idle_timeout(Duration::ZERO).await;
+    with_table(&server).await;
+
+    let (status, body) = server
+        .pipeline(None, json!({"baton": null, "requests": [execute("BEGIN"), execute("INSERT INTO t VALUES (1)")]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["baton"], Value::Null, "no baton for a stream that cannot be resumed: {body}");
+
+    // The stream was dropped with that request, so its transaction rolled
+    // back and writes are not stuck behind it.
+    let results = server.run(None, vec![execute("SELECT count(*) FROM t"), execute("INSERT INTO t VALUES (2)")]).await;
+    assert_eq!(count(&results), "0");
+    assert_eq!(results[1]["type"], "ok", "{}", results[1]);
+}
+
+#[tokio::test]
 async fn a_batch_runs_steps_by_condition() {
     let server = TestServer::dev().await;
     with_table(&server).await;

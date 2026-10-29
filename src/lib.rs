@@ -269,11 +269,16 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
             // again under its name keeps its token generation, not its file.
             let (generation, file) = (stream.token_generation, stream.file.clone());
             let baton = state.streams.park(stream).await;
-            match state.registry.open(&database, false).await {
-                Ok(now) if now.token_generation <= generation && Arc::ptr_eq(&now.db, &file) => Some(baton),
+            let current = state.registry.open(&database, false).await.is_ok_and(|now| now.token_generation <= generation && Arc::ptr_eq(&now.db, &file));
+            // Looking can wait on the registry for longer than the idle
+            // timeout (a restore holds it while it checks the whole copy), and
+            // the idle reaper may drop the stream meanwhile: the baton goes
+            // out only if its stream is still parked.
+            match current && state.streams.is_parked(&baton).await {
+                true => Some(baton),
                 // Taking the stream back drops it, rolling back its
                 // transaction, and no baton tells the client it is closed.
-                _ => {
+                false => {
                     drop(state.streams.take(&baton).await);
                     None
                 }

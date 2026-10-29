@@ -213,6 +213,13 @@ impl Streams {
         (at.elapsed() < self.idle).then_some(stream)
     }
 
+    /// Whether the stream for a baton is still parked and inside its idle
+    /// timeout, as `take` judges it. A request that waits after parking its
+    /// stream hands out the baton only then (`pipeline`).
+    pub async fn is_parked(&self, baton: &str) -> bool {
+        self.parked.lock().await.get(baton).is_some_and(|(_, at)| at.elapsed() < self.idle)
+    }
+
     /// Drop every parked stream of a database that is being deleted or whose
     /// tokens were rotated. A stream busy with a request is not parked, so
     /// the request checks again once it has parked its stream (`pipeline`).
