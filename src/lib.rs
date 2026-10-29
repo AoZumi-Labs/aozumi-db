@@ -218,7 +218,9 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
 
     let mut stream = match &msg.baton {
         Some(baton) => match state.streams.take(baton).await {
-            Some(stream) if stream.db == database && stream.read_only == read_only => stream,
+            // A stream opened before the database's last rotation is over,
+            // even for a token minted after it.
+            Some(stream) if stream.db == database && stream.read_only == read_only && stream.token_generation >= db.token_generation => stream,
             _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
         },
         None => match open_stream(&database, &db, read_only) {
@@ -250,7 +252,24 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
             stream.release();
             None
         }
-        false => Some(state.streams.park(stream).await),
+        false => {
+            // Rotating the database's tokens or deleting it drops only parked
+            // streams, so it misses a stream that is busy with a request. Look
+            // again once this one is parked: both change the database before
+            // they drop its streams, so either this sees the change or they
+            // find the stream parked.
+            let generation = stream.token_generation;
+            let baton = state.streams.park(stream).await;
+            match state.registry.open(&database, false).await {
+                Ok(now) if now.token_generation <= generation => Some(baton),
+                // Taking the stream back drops it, rolling back its
+                // transaction, and no baton tells the client it is closed.
+                _ => {
+                    drop(state.streams.take(&baton).await);
+                    None
+                }
+            }
+        }
     };
     json(StatusCode::OK, &PipelineResp { baton, base_url: None, results })
 }
@@ -383,7 +402,7 @@ fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result
     let conn = db
         .checkout(BUSY_TIMEOUT, read_only)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
-    Ok(Stream::new(database.to_string(), read_only, conn, db.pool.clone()))
+    Ok(Stream::new(database.to_string(), read_only, db.token_generation, conn, db.pool.clone()))
 }
 
 async fn list_databases(state: &State) -> Resp {
@@ -533,8 +552,9 @@ async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp
 }
 
 /// Revoke every token of a database (`Registry::rotate_tokens`) and drop its
-/// open streams, rolling back their transactions. Tokens minted from now on
-/// carry the new generation.
+/// open streams, rolling back their transactions; a stream busy with a
+/// request ends when that request does (`pipeline`). Tokens minted from now
+/// on carry the new generation.
 async fn rotate_tokens(state: &State, name: &str) -> Resp {
     if state.secret.is_none() {
         return text(StatusCode::BAD_REQUEST, "tokens need a secret; dev mode has none");

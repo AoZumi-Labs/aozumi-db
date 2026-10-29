@@ -1,5 +1,7 @@
 mod common;
 
+use std::time::Duration;
+
 use aozumi_db::{mint_token, Claims};
 use base64::Engine;
 use common::*;
@@ -224,6 +226,38 @@ async fn rotating_drops_the_databases_open_streams() {
     // Another database's stream carries on.
     let (status, body) = server.pipeline(Some(&other), json!({"baton": other_baton, "requests": [{"type": "close"}]})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn rotating_ends_a_stream_that_was_mid_request() {
+    let server = TestServer::with_secret().await;
+    let limits = json!({"name": "notes", "limits": {"max_statement_ms": 1000}});
+    assert_eq!(admin(&server, Method::POST, "/v1/databases", Some(limits)).await.0, StatusCode::CREATED);
+    let old = token(&server, "notes", None).await;
+    server.run(Some(&old), vec![execute("CREATE TABLE t (x)")]).await;
+
+    // The rotation lands while a request that opened a transaction is still
+    // running: its last statement runs until the time limit stops it.
+    let busy = json!({"baton": null, "requests": [
+        execute("BEGIN"),
+        execute("INSERT INTO t VALUES (1)"),
+        execute("WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r) SELECT count(*) FROM r"),
+    ]});
+    let ((status, body), (rotated, _)) = tokio::join!(server.pipeline(Some(&old), busy), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rotate(&server, "notes").await
+    });
+    assert_eq!(rotated, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][2]["error"]["code"], "SQLITE_INTERRUPT", "{body}");
+
+    // The stream ends with that request: no baton comes back to carry it on
+    // with a new token, and its transaction was rolled back.
+    assert_eq!(body["baton"], Value::Null, "{body}");
+    let new = token(&server, "notes", None).await;
+    let results = server.run(Some(&new), vec![execute("SELECT count(*) FROM t"), execute("INSERT INTO t VALUES (2)")]).await;
+    assert_eq!(scalar(&results), "0");
+    assert_eq!(results[1]["type"], "ok", "writes are not stuck behind the dropped transaction: {}", results[1]);
 }
 
 #[tokio::test]
