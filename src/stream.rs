@@ -21,6 +21,9 @@ use crate::proto::{
 pub struct Stream {
     pub db: String,
     pub read_only: bool,
+    /// The database's token generation when the stream opened. Rotating the
+    /// database's tokens past it ends the stream, whatever token comes next.
+    pub token_generation: u64,
     pool: Arc<Pool>,
     /// The stream ran SQL that may leave state on the connection (a pragma
     /// setting, a temporary table), so it is not reused.
@@ -31,8 +34,8 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(db: String, read_only: bool, conn: Conn, pool: Arc<Pool>) -> Self {
-        Self { db, read_only, pool, dirty: false, conn, sqls: HashMap::new(), closed: false }
+    pub fn new(db: String, read_only: bool, token_generation: u64, conn: Conn, pool: Arc<Pool>) -> Self {
+        Self { db, read_only, token_generation, pool, dirty: false, conn, sqls: HashMap::new(), closed: false }
     }
 
     /// A closed stream hands its connection back for reuse when it is clean.
@@ -207,7 +210,8 @@ impl Streams {
     }
 
     /// Drop every parked stream of a database that is being deleted or whose
-    /// tokens were rotated.
+    /// tokens were rotated. A stream busy with a request is not parked, so
+    /// the request checks again once it has parked its stream (`pipeline`).
     pub async fn close_database(&self, db: &str) {
         self.parked.lock().await.retain(|_, (stream, _)| stream.db != db);
     }

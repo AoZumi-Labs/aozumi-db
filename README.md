@@ -85,7 +85,9 @@ never change data.
 
 If a token leaks, rotate its database's tokens. Every token minted for that
 database until now, read-only or not, gets HTTP 401 from then on, and the
-database's open streams are closed. Other databases are not affected.
+database's open streams are closed, rolling back their transactions. A stream
+busy with a request at that moment closes when the request finishes: its
+response carries no baton. Other databases are not affected.
 
 ```bash
 curl -X POST localhost:8080/v1/databases/notes/tokens/rotate -H "authorization: Bearer $AOZUMI_DB_SECRET"
