@@ -78,6 +78,43 @@ async fn latest_picks_the_newest_backup_and_backups_outlive_their_database() {
 }
 
 #[tokio::test]
+async fn restoring_in_place_ends_a_stream_that_was_mid_request() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    let limits = json!({"name": "app", "limits": {"max_statement_ms": 1000}});
+    assert_eq!(server.admin(Method::POST, "/v1/databases", Some(limits)).await.0, StatusCode::CREATED);
+    let app = server.token("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    snapshot(&server, "app").await;
+
+    // The database is deleted and restored under its own name while a
+    // request that opened a transaction is still running: its last statement
+    // runs until the time limit stops it.
+    let busy = json!({"baton": null, "requests": [
+        execute("BEGIN"),
+        execute("INSERT INTO t VALUES (2)"),
+        execute("WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r) SELECT count(*) FROM r"),
+    ]});
+    let ((status, body), (deleted, (restored, restore_body))) = tokio::join!(server.pipeline(Some(&app), busy), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deleted = server.admin(Method::DELETE, "/v1/databases/app", None).await.0;
+        (deleted, restore(&server, "app", "app", "latest").await)
+    });
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+    assert_eq!(restored, StatusCode::CREATED, "{restore_body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][2]["error"]["code"], "SQLITE_INTERRUPT", "{body}");
+
+    // The stream ends with that request: no baton comes back to carry it on
+    // against the deleted database's file, and the restored database, which
+    // the same token reaches, takes writes at once.
+    assert_eq!(body["baton"], Value::Null, "{body}");
+    let results = server.run(Some(&app), vec![execute("SELECT count(*) FROM t"), execute("INSERT INTO t VALUES (3)")]).await;
+    assert_eq!(scalar(&results), "1", "the restored database is the backup");
+    assert_eq!(results[1]["type"], "ok", "writes are not stuck behind the old stream: {}", results[1]);
+}
+
+#[tokio::test]
 async fn a_new_server_can_restore_from_the_same_backup_store() {
     let (_dir, cfg) = backups(10, None);
     let first = TestServer::with_backups(&cfg).await;

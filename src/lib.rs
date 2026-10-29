@@ -219,8 +219,16 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
     let mut stream = match &msg.baton {
         Some(baton) => match state.streams.take(baton).await {
             // A stream opened before the database's last rotation is over,
-            // even for a token minted after it.
-            Some(stream) if stream.db == database && stream.read_only == read_only && stream.token_generation >= db.token_generation => stream,
+            // even for a token minted after it, and so is one whose database
+            // was deleted, even if another has been created under its name.
+            Some(stream)
+                if stream.db == database
+                    && stream.read_only == read_only
+                    && stream.token_generation >= db.token_generation
+                    && Arc::ptr_eq(&stream.file, &db.db) =>
+            {
+                stream
+            }
             _ => return text(StatusCode::BAD_REQUEST, "unknown or expired baton"),
         },
         None => match open_stream(&database, &db, read_only) {
@@ -257,11 +265,12 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
             // streams, so it misses a stream that is busy with a request. Look
             // again once this one is parked: both change the database before
             // they drop its streams, so either this sees the change or they
-            // find the stream parked.
-            let generation = stream.token_generation;
+            // find the stream parked. A database deleted and already created
+            // again under its name keeps its token generation, not its file.
+            let (generation, file) = (stream.token_generation, stream.file.clone());
             let baton = state.streams.park(stream).await;
             match state.registry.open(&database, false).await {
-                Ok(now) if now.token_generation <= generation => Some(baton),
+                Ok(now) if now.token_generation <= generation && Arc::ptr_eq(&now.db, &file) => Some(baton),
                 // Taking the stream back drops it, rolling back its
                 // transaction, and no baton tells the client it is closed.
                 _ => {
@@ -402,7 +411,7 @@ fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result
     let conn = db
         .checkout(BUSY_TIMEOUT, read_only)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
-    Ok(Stream::new(database.to_string(), read_only, db.token_generation, conn, db.pool.clone()))
+    Ok(Stream::new(database.to_string(), read_only, db.token_generation, db.db.clone(), conn, db.pool.clone()))
 }
 
 async fn list_databases(state: &State) -> Resp {

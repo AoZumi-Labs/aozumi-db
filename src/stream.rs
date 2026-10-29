@@ -11,7 +11,7 @@ use rand::RngCore;
 use tokio::sync::Mutex;
 
 use crate::console;
-use crate::engine::Conn;
+use crate::engine::{Conn, Db};
 use crate::registry::Pool;
 use crate::policy;
 use crate::proto::{
@@ -24,6 +24,10 @@ pub struct Stream {
     /// The database's token generation when the stream opened. Rotating the
     /// database's tokens past it ends the stream, whatever token comes next.
     pub token_generation: u64,
+    /// The open database file the stream's connection is on. A database
+    /// deleted and created again under the same name, as an in-place restore
+    /// does, has another one, so the stream ends with the file it opened on.
+    pub file: Db,
     pool: Arc<Pool>,
     /// The stream ran SQL that may leave state on the connection (a pragma
     /// setting, a temporary table), so it is not reused.
@@ -34,8 +38,8 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(db: String, read_only: bool, token_generation: u64, conn: Conn, pool: Arc<Pool>) -> Self {
-        Self { db, read_only, token_generation, pool, dirty: false, conn, sqls: HashMap::new(), closed: false }
+    pub fn new(db: String, read_only: bool, token_generation: u64, file: Db, conn: Conn, pool: Arc<Pool>) -> Self {
+        Self { db, read_only, token_generation, file, pool, dirty: false, conn, sqls: HashMap::new(), closed: false }
     }
 
     /// A closed stream hands its connection back for reuse when it is clean.
