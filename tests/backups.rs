@@ -201,3 +201,138 @@ async fn scheduled_backups_skip_unchanged_databases_and_keep_the_newest() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(count(&server, &server.token("copy").await).await, "3");
 }
+
+/// A database of one 64 MB row, backed up: writing and checking a copy of
+/// it takes a while.
+async fn large_backup(server: &TestServer, db: &str) {
+    let token = server.database(db).await;
+    server.run(Some(&token), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (zeroblob(64000000))")]).await;
+    let backup = snapshot(server, db).await;
+    assert!(backup["size_bytes"].as_u64().unwrap() > 60_000_000, "{backup}");
+}
+
+/// Files in the data directory, at any depth, that are none of these
+/// databases' own.
+fn stray_files(server: &TestServer, databases: &[&str]) -> Vec<std::path::PathBuf> {
+    let root = server.dir.path();
+    let own = |name: &str| databases.iter().any(|db| name.starts_with(&format!("{db}.db")) || name == format!("{db}.tokens.json"));
+    let (mut dirs, mut stray) = (vec![root.to_path_buf()], Vec::new());
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.parent() != Some(root) || !own(&path.file_name().unwrap().to_string_lossy()) {
+                stray.push(path);
+            }
+        }
+    }
+    stray
+}
+
+#[tokio::test]
+async fn a_large_restore_does_not_hold_up_other_databases() {
+    let (_dir, cfg) = backups(10, None);
+    let server = std::sync::Arc::new(TestServer::with_backups(&cfg).await);
+    large_backup(&server, "big").await;
+    let app = server.database("app").await;
+    // Leaves a pooled connection for the request made during the restore.
+    server.run(Some(&app), vec![execute("SELECT 1")]).await;
+
+    let restoring = {
+        let server = server.clone();
+        tokio::spawn(async move { restore(&server, "copy", "big", "latest").await })
+    };
+    // The restore is writing its copy once a file of neither database shows up.
+    while stray_files(&server, &["big", "app"]).is_empty() {
+        assert!(!restoring.is_finished(), "the restore never wrote a copy in the data directory");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Another database's request is answered while that copy is still being
+    // written or checked: before the restored database exists.
+    let results = server.run(Some(&app), vec![execute("SELECT 1")]).await;
+    assert_eq!(scalar(&results), "1");
+    assert_eq!(server.admin(Method::GET, "/v1/databases/copy", None).await.0, StatusCode::NOT_FOUND, "answered only after the restore");
+
+    let (status, body) = restoring.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(count(&server, &server.token("copy").await).await, "1");
+}
+
+#[tokio::test]
+async fn racing_restores_and_a_create_of_one_name_have_one_winner() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    large_backup(&server, "big").await;
+
+    // Two restores into one name, and a create of it that lands while they
+    // are writing their copies.
+    let ((first, _), (second, _), (created, _)) = tokio::join!(
+        restore(&server, "copy", "big", "latest"),
+        restore(&server, "copy", "big", "latest"),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server.admin(Method::POST, "/v1/databases", Some(json!({"name": "copy"}))).await
+        },
+    );
+    let statuses = [first, second, created];
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::CREATED).count(), 1, "one winner: {statuses:?}");
+    assert!(statuses.iter().all(|s| [StatusCode::CREATED, StatusCode::CONFLICT].contains(s)), "{statuses:?}");
+
+    // Nothing overwrote the winner, and the losers left no files.
+    let tables = scalar(&server.run(Some(&server.token("copy").await), vec![execute("SELECT count(*) FROM sqlite_schema")]).await);
+    assert_eq!(tables, if created == StatusCode::CREATED { "0" } else { "1" }, "{statuses:?}");
+    assert_eq!(stray_files(&server, &["big", "copy"]), Vec::<std::path::PathBuf>::new());
+}
+
+#[tokio::test]
+async fn a_backup_that_is_not_a_database_is_refused_and_leaves_no_files() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    server.database("app").await;
+    let id = snapshot(&server, "app").await["id"].as_str().unwrap().to_string();
+    std::fs::write(cfg.dir.join("app").join(format!("{id}.db")), vec![7u8; 64 * 1024]).unwrap();
+
+    let (status, body) = restore(&server, "copy", "app", &id).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(stray_files(&server, &["app"]), Vec::<std::path::PathBuf>::new());
+    assert_eq!(server.admin(Method::GET, "/v1/databases/copy", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(server.admin(Method::POST, "/v1/databases", Some(json!({"name": "copy"}))).await.0, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn writes_to_a_restored_database_reach_its_own_files() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    snapshot(&server, "app").await;
+    assert_eq!(restore(&server, "copy", "app", "latest").await.0, StatusCode::CREATED);
+
+    // The copy was checked elsewhere before it moved into place. A backup of
+    // it reads its files in the data directory, WAL included.
+    let copy = server.token("copy").await;
+    server.run(Some(&copy), vec![execute("INSERT INTO t VALUES (2)")]).await;
+    snapshot(&server, "copy").await;
+    assert_eq!(restore(&server, "copy-of-copy", "copy", "latest").await.0, StatusCode::CREATED);
+    assert_eq!(count(&server, &server.token("copy-of-copy").await).await, "2");
+}
+
+#[tokio::test]
+async fn an_in_place_restore_keeps_the_current_tokens_and_not_revoked_ones() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    let revoked = server.database("app").await;
+    server.run(Some(&revoked), vec![execute("CREATE TABLE t (x)")]).await;
+    snapshot(&server, "app").await;
+    assert_eq!(server.admin(Method::POST, "/v1/databases/app/tokens/rotate", None).await.0, StatusCode::OK);
+    let current = server.token("app").await;
+
+    assert_eq!(server.admin(Method::DELETE, "/v1/databases/app", None).await.0, StatusCode::NO_CONTENT);
+    let (status, body) = restore(&server, "app", "app", "latest").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(count(&server, &current).await, "0", "the current generation carries over");
+    let (status, _) = server.pipeline(Some(&revoked), json!({"baton": null, "requests": [{"type": "close"}]})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked stays revoked");
+}

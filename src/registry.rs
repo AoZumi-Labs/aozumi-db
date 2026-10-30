@@ -213,36 +213,51 @@ impl Registry {
         Ok(())
     }
 
-    /// Create a database from the bytes of a backup.
+    /// Create a database from the bytes of a backup. The copy is written
+    /// and checked in a scratch directory without the registry, so a large
+    /// restore holds up no other database; only moving it into place takes
+    /// the registry.
     pub async fn create_from(&self, name: &str, bytes: Vec<u8>, limits: Limits) -> Result<(), RegistryError> {
         if !valid_name(name) {
             return Err(RegistryError::InvalidName);
         }
+        if tokio::fs::try_exists(self.path(name)).await? {
+            return Err(RegistryError::Exists);
+        }
+        let scratch = self.dir.join(".tmp").join(format!("{name}-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&scratch).await?;
+        let created = self.create_checked(name, &scratch.join(format!("{name}.db")), bytes, limits).await;
+        let _ = tokio::fs::remove_dir_all(&scratch).await;
+        created
+    }
+
+    /// Write the backup to `copy` and check it, then move it into place
+    /// unless the name was taken meanwhile.
+    async fn create_checked(&self, name: &str, copy: &Path, bytes: Vec<u8>, limits: Limits) -> Result<(), RegistryError> {
+        tokio::fs::write(copy, bytes).await?;
+        let checked = copy.to_path_buf();
+        tokio::task::spawn_blocking(move || quick_check(&checked)).await??;
+        // Every create checks that its name is free and makes its file while
+        // holding the registry, so a database made while this copy was
+        // written and checked is seen here and never overwritten.
         let mut open = self.open.lock().await;
         if tokio::fs::try_exists(self.path(name)).await? {
             return Err(RegistryError::Exists);
         }
-        tokio::fs::create_dir_all(&self.dir).await?;
-        let partial = self.dir.join(format!(".{name}.restore"));
-        tokio::fs::write(&partial, bytes).await?;
-        tokio::fs::rename(&partial, self.path(name)).await?;
-        let checked = async {
+        tokio::fs::rename(copy, self.path(name)).await?;
+        let placed = async {
             let db = self.build(name, limits).await?;
-            let check = Conn::open(&db.db, &db.internal_options())?.execute("PRAGMA quick_check", &[], &[], true)?;
-            match check.rows.first().and_then(|row| row.first()) {
-                Some(Value::Text(ok)) if ok == "ok" => Ok(db),
-                other => anyhow::bail!("the backup is not a valid database: {other:?}"),
-            }
+            self.write_limits(name, &limits).await?;
+            anyhow::Ok(db)
         }
         .await;
-        match checked {
+        match placed {
             Ok(db) => {
-                self.write_limits(name, &limits).await?;
                 open.insert(name.to_string(), db);
                 Ok(())
             }
             Err(err) => {
-                let _ = tokio::fs::remove_file(self.path(name)).await;
+                let _ = self.remove_files(name).await;
                 Err(err.into())
             }
         }
@@ -312,6 +327,12 @@ impl Registry {
             return Err(RegistryError::NotFound);
         }
         open.remove(name);
+        self.remove_files(name).await?;
+        Ok(())
+    }
+
+    /// Remove a database's file, its WAL and its other side files.
+    async fn remove_files(&self, name: &str) -> anyhow::Result<()> {
         let file = format!("{name}.db");
         let mut entries = tokio::fs::read_dir(&self.dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -446,6 +467,19 @@ fn generation_from(read: std::io::Result<Vec<u8>>) -> anyhow::Result<u64> {
         Ok(bytes) => Ok(serde_json::from_slice::<TokenGeneration>(&bytes)?.generation),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Check a database file (`PRAGMA quick_check`) and close it again. Blocks.
+/// The engine shares one open database per file, found by device and inode,
+/// which a rename keeps: the file moves into place only after this returns,
+/// so it is opened there afresh.
+fn quick_check(path: &Path) -> anyhow::Result<()> {
+    let db = engine::open(path)?;
+    let check = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA quick_check", &[], &[], true)?;
+    match check.rows.first().and_then(|row| row.first()) {
+        Some(Value::Text(ok)) if ok == "ok" => Ok(()),
+        other => anyhow::bail!("the backup is not a valid database: {other:?}"),
     }
 }
 
