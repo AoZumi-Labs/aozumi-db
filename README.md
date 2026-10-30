@@ -160,6 +160,11 @@ curl -X POST localhost:8080/v1/databases -H "authorization: Bearer $AOZUMI_DB_SE
 Restores never overwrite a live database. A new machine pointed at the same
 backup store can restore every database it finds there.
 
+To restore in place, delete the database, then restore it under its own name.
+Deleting closes the database's open streams, rolling back their transactions,
+so no app carries on with the deleted copy. A stream busy with a request at
+that moment closes when the request finishes: its response carries no baton.
+
 ### Point-in-time restore
 
 With backups on, the WAL is also shipped every second
