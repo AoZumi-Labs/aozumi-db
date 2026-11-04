@@ -19,6 +19,10 @@ use it:
 cargo run --release --example bench -- ycsb ABCDEF --records 100000 --clients 32 --seconds 10
 cargo run --release --example bench -- latency --rate 1000 --clients 32 --seconds 10
 cargo run --release --example bench -- micro --clients 32 --seconds 5
+# as production runs it: checked tokens, backups, the WAL shipped every 5 s
+cargo run --release --example bench -- micro --clients 32 --seconds 5 --prod
+# a server elsewhere
+cargo run --release --example bench -- micro --url https://db.example.com --token "$TOKEN"
 ```
 
 The server runs in the benchmark process on 4 threads and the clients on
@@ -101,6 +105,61 @@ What is left on the table: the server reaches about a third of the bare
 engine's single-thread point-read rate on a shared 6-core laptop where the
 clients run too. Next: a quiet machine for numbers worth publishing, TATP,
 and profiling the read path (JSON encoding, the blocking-pool hop).
+
+## The path apps use (2026-11-04)
+
+The numbers above run client and server in one process. What an app sees
+also includes the network in front of the server. Two probes measure it with
+the requests `@libsql/client` sends (`POST /v2/pipeline` with `execute` and
+`close`), one request at a time over a kept-alive connection:
+
+- `bench/probe/pipeline-latency.mjs` (Node's `fetch`): from where an app
+  runs.
+- `bench/probe/pipeline-latency.py` (Python's standard library only): on the
+  server's own machine, against its loopback, to see the server alone.
+
+Both use one table of 10,000 rows (`--setup` makes it) and print JSON.
+
+AOZUMI's hosted server, release 289c07c: a 2-vCPU ARM VM (AWS t4g.small,
+EBS gp3, ext4) behind a Cloudflare tunnel. The app side was a 0.5-vCPU ARM
+container (AWS Fargate) in the same availability zone, Node 22. The VM was
+idle (load 0.00) with one database.
+
+| Per request, ms | from the app, p50 / p99 | on the server's loopback, p50 / p99 | network's share of p50 |
+|---|---:|---:|---:|
+| `GET /health` | 11.33 / 26.07 | 0.17 / 0.28 | 11.2 |
+| point read | 10.90 / 16.87 | 0.30 / 0.41 | 10.6 (97%) |
+| single-row insert | 14.03 / 32.19 | 3.57 / 4.35 | 10.5 (75%) |
+| 10-row transaction | 13.85 / 18.45 | 3.69 / 4.91 | 10.2 (73%) |
+| point reads, 8 clients, 10 s | 594 ops/s, p50 10.9, p99 57.8 | | |
+
+What this shows:
+
+- **The tunnel is most of every request.** A point read takes 0.30 ms on the
+  server and 10.9 ms from the app, and 8 clients get 594 reads/s. A path
+  inside the network, without the tunnel, is where most of the time is.
+- **Writes are a flush.** A commit of one row costs what a commit of ten does
+  (3.57 vs 3.69 ms). With `synchronous = FULL`, each commit waits for the
+  disk.
+
+A flush on that volume, 200 writes of one 4,120-byte WAL frame each:
+
+| Pattern | p50 | p99 |
+|---|---:|---:|
+| append + `fsync` (the WAL grows after each truncating checkpoint) | 3.05 ms | 3.32 ms |
+| overwrite in place + `fsync` | 2.81 ms | 3.05 ms |
+| append + `fdatasync` | 3.02 ms | 3.41 ms |
+| overwrite in place + `fdatasync` | 0.94 ms | 1.06 ms |
+
+Every commit today appends to a file that grows, and `fsync` also flushes
+its metadata: the 3 ms row. Reusing the WAL in place and syncing it with
+`fdatasync`, as SQLite itself does on Linux, would make it about 1 ms, with
+the same durability.
+
+The YCSB harness runs the server in dev mode by default: no token check, no
+backups. `--prod` runs it with production's settings instead (checked
+tokens, backups with the WAL shipped every 5 s), and `--url … --token …`
+points it at a server elsewhere.
 
 ## Head-to-head with libSQL's server (2026-10-26)
 
