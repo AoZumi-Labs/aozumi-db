@@ -107,6 +107,8 @@ impl OpenDb {
 pub struct Registry {
     dir: PathBuf,
     defaults: Limits,
+    /// For databases without a `<name>.db-backups.json` of their own.
+    default_backup_policy: BackupPolicy,
     synchronous: Synchronous,
     open: Mutex<HashMap<String, OpenDb>>,
 }
@@ -135,8 +137,8 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Registry {
-    pub fn new(dir: PathBuf, defaults: Limits, synchronous: Synchronous) -> Self {
-        Self { dir, defaults, synchronous, open: Mutex::new(HashMap::new()) }
+    pub fn new(dir: PathBuf, defaults: Limits, default_backup_policy: BackupPolicy, synchronous: Synchronous) -> Self {
+        Self { dir, defaults, default_backup_policy, synchronous, open: Mutex::new(HashMap::new()) }
     }
 
     /// Checkpoint every open database whose WAL has grown past
@@ -416,7 +418,7 @@ impl Registry {
         let token_generation = self.read_token_generation(name).await?;
         let backup_policy = match tokio::fs::read(self.backup_policy_path(name)).await {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(err) if err.kind() == ErrorKind::NotFound => BackupPolicy::default(),
+            Err(err) if err.kind() == ErrorKind::NotFound => self.default_backup_policy,
             Err(err) => return Err(err.into()),
         };
         tokio::task::spawn_blocking(move || {

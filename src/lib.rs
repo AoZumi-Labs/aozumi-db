@@ -56,6 +56,8 @@ pub struct Config {
     pub backup: Option<BackupConfig>,
     /// Limits for new databases; each database keeps its own copy.
     pub default_limits: Limits,
+    /// The backup policy of databases that have none of their own.
+    pub default_backup_policy: BackupPolicy,
     /// When commits reach the disk. `Full` unless chosen otherwise.
     pub synchronous: Synchronous,
 }
@@ -68,6 +70,7 @@ impl Config {
             stream_idle_timeout: Duration::from_secs(10),
             backup: None,
             default_limits: Limits::default(),
+            default_backup_policy: BackupPolicy::default(),
             synchronous: Synchronous::Full,
         }
     }
@@ -84,7 +87,7 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir, config.default_limits, config.synchronous),
+        registry: Registry::new(config.data_dir, config.default_limits, config.default_backup_policy, config.synchronous),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),

@@ -228,3 +228,32 @@ async fn backups_asked_for_do_not_split_the_point_in_time_history() {
     let token = server.token("at").await;
     assert_eq!(scalar(&server.run(Some(&token), vec![execute("SELECT count(*) FROM t")]).await), "2");
 }
+
+#[tokio::test]
+async fn a_server_wide_default_retention_covers_databases_without_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = aozumi_db::BackupConfig {
+        target: aozumi_db::BackupTarget::directory(dir.path().join("store")),
+        keep: 1,
+        every: None,
+        wal_every: None,
+    };
+    let server = TestServer::with_secret_and(move |c| {
+        c.backup = Some(backup);
+        c.default_backup_policy = aozumi_db::BackupPolicy { retention_hours: Some(1), ..Default::default() };
+    })
+    .await;
+    server.database("app").await;
+    assert_eq!(listing(&server, "app").await["status"]["policy"]["retention_hours"], 1, "the default, reported as the database's");
+
+    // Kept by age, not by the server's count of 1.
+    let (_, first) = snapshot(&server, "app").await;
+    let (_, second) = snapshot(&server, "app").await;
+    assert_eq!(ids(&kept(&server, "app").await), [second["id"].as_str().unwrap(), first["id"].as_str().unwrap()]);
+
+    // A database's own policy wins, and keeps the default's other values.
+    let (_, body) = policy(&server, "app", json!({"manual_keep": 5})).await;
+    assert_eq!(body["policy"], json!({"retention_hours": 1, "manual_every_seconds": null, "manual_keep": 5}));
+    let (_, body) = policy(&server, "app", json!({"retention_hours": 72})).await;
+    assert_eq!(body["policy"]["retention_hours"], 72);
+}
