@@ -80,9 +80,18 @@ impl BackupTarget {
             Store::Directory(root) => {
                 let path = root.join(key);
                 let dir = path.parent().expect("keys have a directory");
-                tokio::fs::create_dir_all(dir).await?;
                 let partial = dir.join(format!(".{}.partial", rand::random::<u64>()));
-                tokio::fs::write(&partial, bytes).await?;
+                tokio::fs::create_dir_all(dir).await?;
+                if let Err(err) = tokio::fs::write(&partial, &bytes).await {
+                    // Cleaning up a deleted database's backups removes its
+                    // directories once empty, which may be just before this
+                    // write: make it again, once.
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(err.into());
+                    }
+                    tokio::fs::create_dir_all(dir).await?;
+                    tokio::fs::write(&partial, &bytes).await?;
+                }
                 tokio::fs::rename(&partial, path).await?;
                 Ok(())
             }
@@ -138,6 +147,28 @@ impl BackupTarget {
             }
         }
         Ok(out)
+    }
+
+    /// A directory store's directories under `db/` that hold nothing any
+    /// more, deepest first. Nothing for S3, which has no directories.
+    async fn remove_empty_dirs(&self, db: &str) {
+        let Store::Directory(root) = &self.0 else { return };
+        let top = root.join(db);
+        let (mut pending, mut dirs) = (vec![top.clone()], Vec::new());
+        while let Some(dir) = pending.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { continue };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+            dirs.push(dir);
+        }
+        // Parents come before their children; remove children first. A
+        // directory something was written to meanwhile stays.
+        for dir in dirs.into_iter().rev() {
+            let _ = tokio::fs::remove_dir(&dir).await;
+        }
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
@@ -453,6 +484,39 @@ impl Backups {
             Err(err) => self.record_failure(db, err),
         }
         (held, stored)
+    }
+
+    /// The store keys of every backup of a database and its WAL, listed
+    /// under the database's backup lock, so no shipping round is mid-upload.
+    pub async fn backup_keys(&self, db: &str) -> Result<Vec<String>, BackupError> {
+        self.config()?;
+        let lock = self.lock(db);
+        let _held = lock.lock().await;
+        let mut keys = Vec::new();
+        for snapshot in self.list(db).await? {
+            if snapshot.kind == Kind::Scheduled {
+                for segment in self.segments(db, &snapshot.id).await? {
+                    keys.push(format!("{}{}", wal_dir(db, &snapshot.id), segment.name));
+                }
+            }
+            keys.push(snapshot_key(db, &snapshot.id, snapshot.kind));
+        }
+        Ok(keys)
+    }
+
+    /// Delete these keys of a database's backups, one after another, logging
+    /// failures; in a directory store, also the directories left empty.
+    pub async fn delete_keys(&self, db: &str, keys: Vec<String>) {
+        let Ok(config) = self.config() else { return };
+        let mut failed = 0;
+        for key in &keys {
+            if let Err(err) = config.target.delete(key).await {
+                failed += 1;
+                eprintln!("aozumi-db: deleting backup {key} failed: {err:?}");
+            }
+        }
+        config.target.remove_empty_dirs(db).await;
+        eprintln!("aozumi-db: deleted {} backup objects of {db}{}", keys.len() - failed, if failed > 0 { format!(", {failed} failed") } else { String::new() });
     }
 
     /// Stop shipping a deleted database's WAL, and forget how its backups went.

@@ -13,12 +13,15 @@ mod stream;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -39,6 +42,9 @@ use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Backup downloads sent at once. Each holds its whole backup in memory
+/// until the last byte is sent, so a few slow clients cannot use it all up.
+const DOWNLOADS_AT_ONCE: usize = 2;
 const DEV_DATABASE: &str = "default";
 /// How often the background checkpointer looks, and from what WAL size
 /// (about 4 MB of pages) it checkpoints.
@@ -82,6 +88,7 @@ struct State {
     rates: RateLimiter,
     streams: Arc<Streams>,
     backups: Backups,
+    downloads: Arc<tokio::sync::Semaphore>,
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
@@ -91,6 +98,7 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
+        downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_AT_ONCE)),
     });
     // Exactly one task checkpoints the WAL: the shipper when point-in-time
     // restore is on, otherwise a background checkpointer.
@@ -143,7 +151,38 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
     }
 }
 
-type Resp = Response<Full<Bytes>>;
+/// Every response's body: bytes in memory, boxed so a backup download can
+/// carry its place in the download limit (`Permitted`) until it is sent.
+type Body = BoxBody<Bytes, Infallible>;
+type Resp = Response<Body>;
+
+fn full(bytes: impl Into<Bytes>) -> Body {
+    Full::new(bytes.into()).boxed()
+}
+
+/// A body that keeps a download permit until hyper drops it: after its last
+/// byte is sent, or when the client goes away.
+struct Permitted {
+    body: Full<Bytes>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl hyper::body::Body for Permitted {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
 
 async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
     let path = req.uri().path().to_string();
@@ -163,7 +202,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                 (&Method::GET, []) => list_databases(&state).await,
                 (&Method::POST, []) => create_database(&state, req).await,
                 (&Method::GET, [name]) => database_info(&state, name).await,
-                (&Method::DELETE, [name]) => delete_database(&state, name).await,
+                (&Method::DELETE, [name]) => delete_database(&state, name, req.uri().query()).await,
                 (&Method::PATCH, [name, "limits"]) => update_limits(&state, name, req).await,
                 (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
                 (&Method::POST, [name, "tokens", "rotate"]) => rotate_tokens(&state, name).await,
@@ -172,6 +211,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                     Err(err) => backup_error(err),
                 },
                 (&Method::GET, [name, "backups"]) => list_backups(&state, name).await,
+                (&Method::GET, [name, "backups", id]) => download_backup(&state, name, id).await,
                 (&Method::PATCH, [name, "backups"]) => update_backup_policy(&state, name, req).await,
                 (&Method::POST, [name, "restore"]) => restore_in_place(&state, name, req).await,
                 _ => text(StatusCode::NOT_FOUND, "not found"),
@@ -203,7 +243,7 @@ async fn token_database(state: &State, req: &Request<Incoming>) -> Result<(Strin
             return Err(Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("retry-after", retry_after.to_string())
-                .body(Full::new(Bytes::from("this database is over its request rate limit")))
+                .body(full("this database is over its request rate limit"))
                 .unwrap());
         }
     }
@@ -665,13 +705,46 @@ async fn update_backup_policy(state: &State, name: &str, req: Request<Incoming>)
     }
 }
 
-async fn delete_database(state: &State, name: &str) -> Resp {
+/// A backup as a database file: `application/vnd.sqlite3`, `latest` or an id.
+async fn download_backup(state: &State, name: &str, id: &str) -> Resp {
+    let permit = state.downloads.clone().acquire_owned().await.expect("the download limit is never closed");
+    match state.backups.fetch(name, id).await {
+        Ok((bytes, info)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/vnd.sqlite3")
+            .header("content-disposition", format!("attachment; filename=\"{name}-{}.db\"", info.id))
+            .body(Permitted { body: Full::new(Bytes::from(bytes)), _permit: permit }.boxed())
+            .unwrap(),
+        Err(err) => backup_error(err),
+    }
+}
+
+/// Delete a database and its files. With `?backups=delete` its backups go
+/// too, WAL included: those there now are listed before this answers and
+/// deleted in the background, so a database created again under the name
+/// keeps its own. Without, they stay, for a restore later.
+async fn delete_database(state: &Arc<State>, name: &str, query: Option<&str>) -> Resp {
+    let with_backups = match query {
+        None | Some("") | Some("backups=keep") => false,
+        Some("backups=delete") => true,
+        Some(_) => return text(StatusCode::BAD_REQUEST, "a delete takes `?backups=delete` or `?backups=keep`"),
+    };
     match state.registry.delete(name).await {
         Ok(()) => {
             state.streams.close_database(name).await;
             state.rates.forget(name);
             state.backups.forget(name).await;
-            Response::builder().status(StatusCode::NO_CONTENT).body(Full::default()).unwrap()
+            if with_backups {
+                match state.backups.backup_keys(name).await {
+                    Ok(keys) => {
+                        let (state, name) = (state.clone(), name.to_string());
+                        tokio::spawn(async move { state.backups.delete_keys(&name, keys).await });
+                    }
+                    Err(BackupError::NotConfigured) => {}
+                    Err(err) => return backup_error(err),
+                }
+            }
+            Response::builder().status(StatusCode::NO_CONTENT).body(full(Bytes::new())).unwrap()
         }
         Err(err) => registry_error(err),
     }
@@ -769,7 +842,7 @@ fn backup_error(err: BackupError) -> Resp {
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("retry-after", seconds.to_string())
                 .header("content-type", "text/plain; charset=utf-8")
-                .body(Full::new(Bytes::from(format!("a backup of this database was asked for recently; try again in {seconds} s"))))
+                .body(full(format!("a backup of this database was asked for recently; try again in {seconds} s")))
                 .unwrap()
         }
         BackupError::Registry(err) => registry_error(err),
@@ -781,7 +854,7 @@ fn json<T: serde::Serialize>(status: StatusCode, body: &T) -> Resp {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(serde_json::to_vec(body).unwrap())))
+        .body(full(serde_json::to_vec(body).unwrap()))
         .unwrap()
 }
 
@@ -794,6 +867,6 @@ fn text(status: StatusCode, body: &str) -> Resp {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(full(body.to_string()))
         .unwrap()
 }
