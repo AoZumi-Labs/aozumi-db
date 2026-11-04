@@ -12,12 +12,24 @@ use std::time::Duration;
 use turso_core::Numeric;
 use turso_core::{CheckpointMode, Database, LimboError, SqliteDialect, Value as Core, IO};
 
+use crate::io::{DataSyncIo, SyncMethod};
 use crate::proto::{Col, Error, StmtResult, Value};
 
 pub type Db = Arc<Database>;
 
+/// Open a database file through the engine's own platform layer: for the
+/// server's scratch copies, whose syncs do not matter.
 pub fn open(path: &Path) -> Result<Db, LimboError> {
-    let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new()?);
+    open_with(path, SyncMethod::Fsync)
+}
+
+/// Open a database file whose commits reach the disk as `method` says.
+pub fn open_with(path: &Path, method: SyncMethod) -> Result<Db, LimboError> {
+    let platform: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new()?);
+    let io: Arc<dyn IO> = match method {
+        SyncMethod::DataSync => Arc::new(DataSyncIo::new(platform)),
+        SyncMethod::Fsync => platform,
+    };
     let path = path.to_str().ok_or_else(|| LimboError::InvalidArgument("database path is not UTF-8".into()))?;
     Database::open_file(io, path, Arc::new(SqliteDialect))
 }
@@ -57,6 +69,12 @@ pub struct WalPosition {
 
 /// Bytes of one WAL frame header.
 pub const FRAME_HEADER: usize = 24;
+
+/// A WAL reused in place keeps the size it grew to. Past this many frames
+/// (about 17 MB of 4 KB pages), a checkpoint truncates it instead, as
+/// SQLite's `journal_size_limit` does, so a burst of writes or a backup store
+/// that was down leaves no large WAL behind.
+pub const WAL_REUSE_MAX_FRAMES: u64 = 4096;
 
 /// Compiled statements kept per connection, by SQL text.
 const STATEMENT_CACHE: usize = 64;
@@ -242,6 +260,24 @@ impl Conn {
     pub fn checkpoint_truncate(&self) -> anyhow::Result<u64> {
         let result = self.inner.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
         Ok(result.wal_checkpoint_backfilled)
+    }
+
+    /// As [`Self::checkpoint_truncate`], but the WAL keeps its size and the
+    /// next commit writes from its start, so commits overwrite the file
+    /// instead of growing it (cheaper to sync; see `crate::io`).
+    pub fn checkpoint_restart(&self) -> anyhow::Result<u64> {
+        let result = self.inner.checkpoint(CheckpointMode::Restart)?;
+        Ok(result.wal_checkpoint_backfilled)
+    }
+
+    /// Copy every WAL frame into the database file and start the WAL over:
+    /// in place with `SyncMethod::DataSync`, unless the WAL holds more than
+    /// `WAL_REUSE_MAX_FRAMES` (`frames`); truncated otherwise, and with `Fsync`.
+    pub fn checkpoint_all_frames(&self, method: SyncMethod, frames: u64) -> anyhow::Result<u64> {
+        match method {
+            SyncMethod::DataSync if frames <= WAL_REUSE_MAX_FRAMES => self.checkpoint_restart(),
+            _ => self.checkpoint_truncate(),
+        }
     }
 
     fn error(&self, err: LimboError) -> Error {

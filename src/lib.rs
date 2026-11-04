@@ -5,6 +5,7 @@ mod auth;
 mod backup;
 mod console;
 mod engine;
+mod io;
 mod limits;
 mod policy;
 mod proto;
@@ -35,6 +36,7 @@ pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
 use backup::{BackupError, BackupInfo, Backups, Kind};
 use proto::{PipelineReq, PipelineResp};
 pub use engine::Synchronous;
+pub use io::SyncMethod;
 pub use limits::{BackupPolicy, Limits};
 use limits::{BackupPolicyPatch, LimitsPatch, RateLimiter};
 pub use registry::token_generation;
@@ -66,6 +68,8 @@ pub struct Config {
     pub default_backup_policy: BackupPolicy,
     /// When commits reach the disk. `Full` unless chosen otherwise.
     pub synchronous: Synchronous,
+    /// How they get there: `fdatasync` and a WAL reused in place, unless chosen otherwise.
+    pub sync_method: SyncMethod,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
             default_limits: Limits::default(),
             default_backup_policy: BackupPolicy::default(),
             synchronous: Synchronous::Full,
+            sync_method: SyncMethod::default(),
         }
     }
 }
@@ -94,7 +99,7 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir, config.default_limits, config.default_backup_policy, config.synchronous),
+        registry: Registry::new(config.data_dir, config.default_limits, config.default_backup_policy, config.synchronous, config.sync_method),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),

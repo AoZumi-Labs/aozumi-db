@@ -66,6 +66,7 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `AOZUMI_DB_BACKUP_KEEP` | `24` | Backups kept per database |
 | `AOZUMI_DB_BACKUP_WAL_MS` | `1000` | Ship the WAL this often for point-in-time restore; `0` = off |
 | `AOZUMI_DB_BACKUP_RETENTION_HOURS` | unset | Keep the backups of databases without a policy of their own for this many hours, instead of by count |
+| `AOZUMI_DB_SYNC_METHOD` | `fdatasync` | How commits reach the disk: `fdatasync` with the WAL reused in place after checkpoints, or `fsync` with the WAL truncated (the engine's own way) |
 | `AOZUMI_DB_S3_ENDPOINT` | AWS S3 | An S3-compatible endpoint, e.g. Cloudflare R2 or MinIO |
 | `AOZUMI_DB_MAX_SIZE_BYTES` | `0` (none) | Default size limit for new databases |
 | `AOZUMI_DB_MAX_STATEMENT_MS` | `10000` | Default statement time limit; `0` = none |

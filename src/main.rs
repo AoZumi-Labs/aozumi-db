@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, token_generation, BackupConfig, BackupPolicy, BackupTarget, Claims, Config, Limits, Synchronous};
+use aozumi_db::{mint_token, token_generation, BackupConfig, BackupPolicy, BackupTarget, Claims, Config, Limits, SyncMethod, Synchronous};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
@@ -67,6 +67,14 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
             Synchronous::Normal
         }
         Ok(other) => anyhow::bail!("AOZUMI_DB_SYNCHRONOUS must be full or normal, got {other:?}"),
+    };
+    config.sync_method = match std::env::var("AOZUMI_DB_SYNC_METHOD").as_deref() {
+        Err(_) | Ok("fdatasync") => SyncMethod::DataSync,
+        Ok("fsync") => {
+            eprintln!("aozumi-db: sync method = fsync: commits sync with fsync and checkpoints truncate the WAL");
+            SyncMethod::Fsync
+        }
+        Ok(other) => anyhow::bail!("AOZUMI_DB_SYNC_METHOD must be fdatasync or fsync, got {other:?}"),
     };
     if config.backup.is_none() {
         eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");

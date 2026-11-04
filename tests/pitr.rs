@@ -99,10 +99,16 @@ async fn point_in_time_survives_wal_checkpoints() {
     let middle = mark().await;
     server.run(Some(&app), batch(800)).await;
     tokio::time::sleep(SETTLE).await;
-    let end = now_ms();
 
-    let wal = std::fs::metadata(server.dir.path().join("app.db-wal")).map(|m| m.len()).unwrap_or(0);
-    assert!(wal < 4 * 1024 * 1024, "the shipper checkpointed the WAL ({wal} bytes)");
+    // The shipper checkpointed the WAL: it starts over in place, so one more
+    // commit overwrites it instead of growing it.
+    let wal_size = || std::fs::metadata(server.dir.path().join("app.db-wal")).map(|m| m.len()).unwrap_or(0);
+    let checkpointed = wal_size();
+    server.run(Some(&app), vec![execute("INSERT INTO t VALUES (-1)")]).await;
+    assert_eq!(wal_size(), checkpointed, "the WAL was checkpointed and is reused");
+    server.run(Some(&app), vec![execute("DELETE FROM t WHERE i = -1")]).await;
+    tokio::time::sleep(SETTLE).await;
+    let end = now_ms();
 
     restore_at(&server, "middle", "app", json!(middle)).await;
     assert_eq!(rows(&server, "middle", "SELECT count(*) FROM t").await[0][0]["value"], "800");

@@ -129,13 +129,19 @@ fn main() {
             let addr = server.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-                let config = match prod {
+                let mut config = match prod {
                     false => aozumi_db::Config::new(data.join("data"), None),
                     true => production_config(&data),
+                };
+                // As the server reads it, so one binary measures both ways.
+                config.sync_method = match std::env::var("AOZUMI_DB_SYNC_METHOD").as_deref() {
+                    Ok("fsync") => aozumi_db::SyncMethod::Fsync,
+                    _ => aozumi_db::SyncMethod::DataSync,
                 };
                 tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });
                 addr
             });
+            println!("sync method: {}", std::env::var("AOZUMI_DB_SYNC_METHOD").unwrap_or_else(|_| "fdatasync".into()));
             match args.prod {
                 false => println!("server: in this process, dev mode (no token check, no backups)"),
                 true => {

@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
 use crate::engine::{self, Conn, ConnOptions, Db, Synchronous, WalPosition};
+use crate::io::SyncMethod;
 use crate::limits::{BackupPolicy, BackupPolicyPatch, Limits, LimitsPatch};
 use crate::proto::Value;
 
@@ -45,6 +46,7 @@ pub struct OpenDb {
     /// instead of writing to it, and a stream on it ends with its request.
     closing: Arc<AtomicBool>,
     synchronous: Synchronous,
+    sync_method: SyncMethod,
 }
 
 /// Idle connections of one database, kept per access level. Connections
@@ -117,6 +119,11 @@ impl OpenDb {
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::Release);
     }
+
+    /// How this database's commits reach the disk, which decides how its WAL is checkpointed.
+    pub fn sync_method(&self) -> SyncMethod {
+        self.sync_method
+    }
 }
 
 /// A restored copy of a database, written and checked in a scratch
@@ -160,6 +167,7 @@ pub struct Registry {
     /// For databases without a `<name>.db-backups.json` of their own.
     default_backup_policy: BackupPolicy,
     synchronous: Synchronous,
+    sync_method: SyncMethod,
     open: Mutex<HashMap<String, OpenDb>>,
 }
 
@@ -187,13 +195,13 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Registry {
-    pub fn new(dir: PathBuf, defaults: Limits, default_backup_policy: BackupPolicy, synchronous: Synchronous) -> Self {
-        Self { dir, defaults, default_backup_policy, synchronous, open: Mutex::new(HashMap::new()) }
+    pub fn new(dir: PathBuf, defaults: Limits, default_backup_policy: BackupPolicy, synchronous: Synchronous, sync_method: SyncMethod) -> Self {
+        Self { dir, defaults, default_backup_policy, synchronous, sync_method, open: Mutex::new(HashMap::new()) }
     }
 
     /// Checkpoint every open database whose WAL has grown past
     /// `threshold` frames: a passive pass that blocks no one, then a short
-    /// truncating one. Skipped for a database when a transaction is in the
+    /// one that starts the WAL over (`Conn::checkpoint_all_frames`). Skipped for a database when a transaction is in the
     /// way; the next round tries again. Only for servers without WAL
     /// shipping, which checkpoints on its own schedule.
     pub async fn checkpoint_all(&self, threshold: u64) {
@@ -201,11 +209,12 @@ impl Registry {
         for db in open {
             let checkpointed = tokio::task::spawn_blocking(move || {
                 let conn = Conn::open(&db.db, &db.internal_options())?;
-                if conn.wal_position()?.frame < threshold {
+                let frames = conn.wal_position()?.frame;
+                if frames < threshold {
                     return anyhow::Ok(());
                 }
                 conn.checkpoint_passive(None)?;
-                match conn.checkpoint_truncate() {
+                match conn.checkpoint_all_frames(db.sync_method(), frames) {
                     Ok(_) => Ok(()),
                     Err(err) if err.downcast_ref::<turso_core::LimboError>().is_some_and(|e| matches!(e, turso_core::LimboError::Busy)) => Ok(()),
                     Err(err) => Err(err),
@@ -547,7 +556,7 @@ impl Registry {
     async fn build(&self, name: &str, limits: Limits) -> anyhow::Result<OpenDb> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path(name);
-        let synchronous = self.synchronous;
+        let (synchronous, sync_method) = (self.synchronous, self.sync_method);
         let token_generation = self.read_token_generation(name).await?;
         let backup_policy = match tokio::fs::read(self.backup_policy_path(name)).await {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -555,7 +564,7 @@ impl Registry {
             Err(err) => return Err(err.into()),
         };
         tokio::task::spawn_blocking(move || {
-            let db = engine::open(&path)?;
+            let db = engine::open_with(&path, sync_method)?;
             let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
             let page_size = match result.rows.first().and_then(|row| row.first()) {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
@@ -571,6 +580,7 @@ impl Registry {
                 pool: Arc::default(),
                 closing: Arc::default(),
                 synchronous,
+                sync_method,
             })
         })
         .await?

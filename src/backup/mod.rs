@@ -891,12 +891,13 @@ enum Checkpoint {
 /// transaction is in the way. Blocks.
 fn checkpoint(open: &OpenDb, shipped_to: u64) -> anyhow::Result<Checkpoint> {
     let conn = Conn::open(&open.db, &open.internal_options())?;
-    if conn.wal_position()?.frame > shipped_to {
+    let frames = conn.wal_position()?.frame;
+    if frames > shipped_to {
         return Ok(Checkpoint::Skipped);
     }
-    // One truncating pass, not passive-then-truncate: the frame count it
-    // reports must cover the whole WAL for the check against `shipped_to`.
-    match conn.checkpoint_truncate() {
+    // One pass over the whole WAL, not passive-then-restart: the frame count
+    // it reports must cover the whole WAL for the check against `shipped_to`.
+    match conn.checkpoint_all_frames(open.sync_method(), frames) {
         Ok(backfilled) => Ok(Checkpoint::Done { backfilled }),
         Err(err) if err.downcast_ref::<turso_core::LimboError>().is_some_and(|e| matches!(e, turso_core::LimboError::Busy)) => {
             Ok(Checkpoint::Skipped)
