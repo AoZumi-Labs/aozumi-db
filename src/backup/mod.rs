@@ -110,9 +110,20 @@ impl BackupTarget {
                     Err(err) => return Err(err.into()),
                 };
                 while let Some(entry) = entries.next_entry().await? {
-                    let meta = entry.metadata().await?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // An upload in progress (`.<n>.partial`) is not an object
+                    // yet, and is renamed away at any moment.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let meta = match entry.metadata().await {
+                        Ok(meta) => meta,
+                        // Gone since the directory was read: pruned meanwhile.
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
                     if meta.is_file() {
-                        out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
+                        out.push((name, meta.len()));
                     }
                 }
             }
