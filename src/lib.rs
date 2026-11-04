@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 
 pub use auth::{mint as mint_token, Claims};
 pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
-use backup::{BackupError, Backups};
+use backup::{BackupError, Backups, Kind};
 use proto::{PipelineReq, PipelineResp};
 pub use engine::Synchronous;
 pub use limits::Limits;
@@ -164,7 +164,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                 (&Method::PATCH, [name, "limits"]) => update_limits(&state, name, req).await,
                 (&Method::POST, [name, "tokens"]) => create_token(&state, name, req).await,
                 (&Method::POST, [name, "tokens", "rotate"]) => rotate_tokens(&state, name).await,
-                (&Method::POST, [name, "backups"]) => match state.backups.snapshot(&state.registry, name).await {
+                (&Method::POST, [name, "backups"]) => match state.backups.snapshot(&state.registry, name, Kind::Manual).await {
                     Ok(info) => json(StatusCode::CREATED, &info),
                     Err(err) => backup_error(err),
                 },
@@ -515,13 +515,10 @@ async fn update_limits(state: &State, name: &str, req: Request<Incoming>) -> Res
     }
 }
 
+/// `{"backups", "point_in_time", "status"}`: see `backup::Listing`.
 async fn list_backups(state: &State, name: &str) -> Resp {
-    let backups = match state.backups.list(name).await {
-        Ok(backups) => backups,
-        Err(err) => return backup_error(err),
-    };
-    match state.backups.window(name).await {
-        Ok(window) => json(StatusCode::OK, &json!({"backups": backups, "point_in_time": window})),
+    match state.backups.listing(name).await {
+        Ok(listing) => json(StatusCode::OK, &listing),
         Err(err) => backup_error(err),
     }
 }

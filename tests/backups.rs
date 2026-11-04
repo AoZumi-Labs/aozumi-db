@@ -30,8 +30,118 @@ async fn restore(server: &TestServer, into: &str, from: &str, backup: &str) -> (
         .await
 }
 
+/// The file in a directory store that holds backup `id` of `db`, whatever its kind.
+fn backup_file(store: &std::path::Path, db: &str, id: &str) -> std::path::PathBuf {
+    let dir = store.join(db);
+    let name = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with(&format!("{id}.")))
+        .unwrap_or_else(|| panic!("no file for backup {id} in {}", dir.display()));
+    dir.join(name)
+}
+
 async fn count(server: &TestServer, token: &str) -> Value {
     scalar(&server.run(Some(token), vec![execute("SELECT count(*) FROM t")]).await)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+async fn listing(server: &TestServer, db: &str) -> Value {
+    let (status, body) = server.admin(Method::GET, &format!("/v1/databases/{db}/backups"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// Polls the listing until `done` holds, for at most 5 s.
+async fn listing_until(server: &TestServer, db: &str, done: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..250 {
+        let body = listing(server, db).await;
+        if done(&body) {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("never true: {}", listing(server, db).await);
+}
+
+#[tokio::test]
+async fn each_backup_says_when_it_was_taken_and_why() {
+    let (_dir, cfg) = backups(10, Some(Duration::from_millis(100)));
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)")]).await;
+    // The server's own schedule backs it up first. A tick may land between
+    // creating the database and its table, so let the schedule settle: no
+    // backups while the database is unchanged.
+    listing_until(&server, "app", |b| !b["backups"].as_array().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let settled = list(&server, "app").await;
+
+    let before = now_ms();
+    let manual = snapshot(&server, "app").await;
+    let after = now_ms();
+    assert_eq!(manual["kind"], "manual", "{manual}");
+    let taken = manual["taken_ms"].as_u64().unwrap();
+    assert!((before..=after).contains(&taken), "{before} <= {taken} <= {after}");
+    assert_eq!(manual["id"].as_str().unwrap().parse::<u64>().unwrap(), taken, "the id is the time it was taken");
+
+    let listed = list(&server, "app").await;
+    assert_eq!(listed[0], manual, "newest first, as the backup answered");
+    assert_eq!(listed[1..], settled[..], "the schedule's backups are still there");
+    let scheduled = listed.last().unwrap();
+    assert_eq!(scheduled["kind"], "scheduled", "{scheduled}");
+    assert!(scheduled["taken_ms"].as_u64().unwrap() < taken);
+
+    // Both kinds restore.
+    for (name, backup) in [("from-manual", &manual), ("from-scheduled", scheduled)] {
+        let (status, body) = restore(&server, name, "app", backup["id"].as_str().unwrap()).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_status_says_when_the_database_was_last_backed_up() {
+    let (_dir, cfg) = backups(10, None);
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    let status = &listing(&server, "app").await["status"];
+    assert_eq!(status["last_backup_ms"], Value::Null, "nothing yet: {status}");
+    assert_eq!(status["up_to_date_ms"], Value::Null, "{status}");
+    assert_eq!(status["last_failure"], Value::Null, "{status}");
+    assert_eq!(status["every_seconds"], Value::Null, "only on request: {status}");
+    assert_eq!(status["wal_every_ms"], Value::Null, "{status}");
+    assert_eq!(status["keep"], 10, "{status}");
+
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)")]).await;
+    let backup = snapshot(&server, "app").await;
+    let status = &listing(&server, "app").await["status"];
+    assert_eq!(status["last_backup_ms"], backup["taken_ms"], "{status}");
+    let up_to_date = status["up_to_date_ms"].as_u64().unwrap();
+    assert!(up_to_date <= backup["taken_ms"].as_u64().unwrap() + 1000, "{status}");
+}
+
+#[tokio::test]
+async fn with_wal_shipping_the_status_follows_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Backups { dir: dir.path().to_path_buf(), keep: 10, every: Some(Duration::from_secs(3600)), wal: Some(Duration::from_millis(50)) };
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)")]).await;
+
+    for i in 0..3 {
+        server.run(Some(&app), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
+        let written = now_ms();
+        let body = listing_until(&server, "app", |b| b["status"]["up_to_date_ms"].as_u64().is_some_and(|ms| ms >= written)).await;
+        let status = &body["status"];
+        assert_eq!(status["every_seconds"], 3600, "{status}");
+        assert_eq!(status["wal_every_ms"], 50, "{status}");
+        assert_eq!(status["last_failure"], Value::Null, "{status}");
+        let last = status["last_backup_ms"].as_u64().unwrap();
+        assert_eq!(Some(last), body["point_in_time"]["latest_ms"].as_u64(), "the newest thing in the store: {body}");
+    }
 }
 
 #[tokio::test]
@@ -164,7 +274,8 @@ async fn restore_reads_only_from_the_backup_store() {
     // A valid backup file beside the store, not in it.
     let outside = dir.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
-    std::fs::copy(cfg.dir.join("app").join(format!("{id}.db")), outside.join(format!("{id}.db"))).unwrap();
+    let file = backup_file(&cfg.dir, "app", &id);
+    std::fs::copy(&file, outside.join(file.file_name().unwrap())).unwrap();
 
     for source in ["../outside", outside.to_str().unwrap()] {
         let (status, body) = restore(&server, "copy", source, &id).await;
@@ -329,7 +440,7 @@ async fn a_backup_that_is_not_a_database_is_refused_and_leaves_no_files() {
     let server = TestServer::with_backups(&cfg).await;
     server.database("app").await;
     let id = snapshot(&server, "app").await["id"].as_str().unwrap().to_string();
-    std::fs::write(cfg.dir.join("app").join(format!("{id}.db")), vec![7u8; 64 * 1024]).unwrap();
+    std::fs::write(backup_file(&cfg.dir, "app", &id), vec![7u8; 64 * 1024]).unwrap();
 
     let (status, body) = restore(&server, "copy", "app", &id).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");

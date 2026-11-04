@@ -25,6 +25,8 @@ struct Fake {
     /// Access key id and session token of every S3 request, in order.
     seen: Vec<(String, Option<String>)>,
     imds_calls: usize,
+    /// Every upload fails, as when the bucket refuses writes.
+    fail_puts: bool,
 }
 
 async fn fake_s3() -> (SocketAddr, Arc<Mutex<Fake>>) {
@@ -98,6 +100,7 @@ async fn handle(state: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) ->
     };
     let key = rest.trim_start_matches('/').to_string();
     match parts.method {
+        Method::PUT if fake.fail_puts => reply(StatusCode::INTERNAL_SERVER_ERROR, "<Error><Code>InternalError</Code></Error>"),
         Method::PUT => {
             fake.objects.insert(key, body);
             reply(StatusCode::OK, "")
@@ -231,6 +234,32 @@ async fn s3_errors_are_reported() {
     let (status, body) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body.as_str().unwrap().contains("NoSuchBucket"), "{body}");
+}
+
+#[tokio::test]
+async fn a_failing_store_shows_in_the_status_until_a_backup_succeeds() {
+    let (addr, fake) = fake_s3().await;
+    let target = BackupTarget::s3(options(addr, "backups", static_key())).unwrap();
+    let server = TestServer::with_backup_target(target, 5, None).await;
+    server.database("app").await;
+
+    fake.lock().unwrap().fail_puts = true;
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let (status, body) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let (status, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::OK, "listing still works while uploads fail: {listed}");
+    let failure = &listed["status"]["last_failure"];
+    assert!(failure["at_ms"].as_u64().unwrap() >= before, "{listed}");
+    assert!(failure["message"].as_str().unwrap().contains("InternalError"), "{listed}");
+    assert_eq!(listed["status"]["last_backup_ms"], serde_json::Value::Null, "{listed}");
+
+    fake.lock().unwrap().fail_puts = false;
+    let (status, backup) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{backup}");
+    let (_, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
+    assert_eq!(listed["status"]["last_failure"], serde_json::Value::Null, "a success clears it: {listed}");
+    assert_eq!(listed["status"]["last_backup_ms"], backup["taken_ms"], "{listed}");
 }
 
 #[test]
