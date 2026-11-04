@@ -60,6 +60,7 @@ aozumi-db (hyper + tokio)
 | D24 | Each backup's kind is in its name (`<id>.db` scheduled, `<id>.manual.db`, `<id>.before-restore.db`); a database's backup status is what the store holds plus what the server saw since it started | The console must tell people when their data was last safe and why a backup exists. A name is enough for the kind, and servers that do not know a name leave the file alone. The newest backup comes from the store, so it survives restarts; whether everything is in the store (`up_to_date_ms`) and the last failure are only known to the running server, so they are kept in memory. |
 | D25 | Each database has its own backup policy, set through the admin API and kept beside it: retention by age, and how often and how many backups may be asked for. With WAL shipping, only the server's own snapshots start a generation | A hosted product promises "restore to any moment in the last N days", which a count cannot: 48 snapshots were two days for a busy database and weeks for an idle one. Pruning keeps the newest scheduled snapshot from before the window, so the window's first moment stays restorable, and never the database's newest. A generation is a snapshot plus the WAL after it, so a manual snapshot that started one would cut the history wherever it was pruned. The policy has its own endpoint, not `limits`, so a control plane can send it to an older server and get 404 instead of breaking database creation. |
 | D26 | A restore in place is one admin call. It stores what it replaces as a `before_restore` backup before swapping the file, and holds the database's writer turn and write lock from that copy to the swap. A write that waited for its turn looks the database up again | Deleting and restoring under the same name left a gap where the name 404'd and nothing to undo with. Holding both locks means every acknowledged commit is either in the undo backup or in the restored database: commits before the copy are in the copy, none can land on the old file after it, and a writer queued behind the restore finds its database closing and moves to the new file. Its open transactions end first, or a parked one would hold the write lock until it idled out. The old WAL goes before the new file moves in, so it is never replayed onto it. |
+| D27 | HTTPS in the server, on a second listener, for clients in the same network. The certificate is a pair of PEM files another program renews; the server reads them again when they change (checked at most once a second, as connections arrive) and uses a pair only when the key matches. ACME HTTP-01 challenges are answered from a webroot on the plain listener. The listener caps connections in all and per address, and times out handshakes (10 s) and header reads (30 s, idle kept-alive connections included) | Behind a tunnel, a point read the server answers in 0.30 ms takes 10.9 ms from an app in the same zone (BENCHMARKS.md); apps there can reach the server directly. TLS in the process keeps the path to one hop and the server to one binary. A webroot lets a standard ACME client renew through the public path the server already has, with no DNS credentials on the machine. The listener's clients can be other tenants' code, so no one of them may hold every connection. |
 
 ## HTTP surface
 
@@ -69,6 +70,8 @@ aozumi-db (hyper + tokio)
   `store_sql`, `close_sql`, `get_autocommit`, `close`)
 - `POST /v1/console/run`, `GET /v1/console/schema`, `POST /v1/console/rows`:
   the console API (D22), database token
+- `GET /.well-known/acme-challenge/<token>`: an ACME HTTP-01 answer from
+  `AOZUMI_DB_ACME_WEBROOT` (D27); 404 without it
 - Admin, `Authorization: Bearer <admin secret>`: see the API table in the README.
 
 Database names: `[a-z0-9][a-z0-9-]{0,62}`.
@@ -81,6 +84,7 @@ Database names: `[a-z0-9][a-z0-9-]{0,62}`.
 | `AOZUMI_DB_DATA_DIR` | `./data` | Where database files live |
 | `AOZUMI_DB_SECRET` | required | HMAC key for database tokens and the admin API |
 | `AOZUMI_DB_DEV` | unset | `1` = dev mode without a secret (D9) |
+| `AOZUMI_DB_TLS_LISTEN` | unset | A second listener, HTTPS (D27), with `AOZUMI_DB_TLS_CERT` and `AOZUMI_DB_TLS_KEY` |
 
 Backup and limit settings are listed in the README.
 
