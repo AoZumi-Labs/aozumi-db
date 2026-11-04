@@ -206,6 +206,34 @@ curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI
   the next WAL shipping round or scheduled backup.
 - `last_failure` (`{"at_ms", "message"}`) is the last snapshot or WAL upload
   that failed, until one succeeds again.
+- `policy` is the database's own backup policy, below.
+
+### A database's backup policy
+
+By default a database keeps the newest `AOZUMI_DB_BACKUP_KEEP` backups, and
+backups can be asked for at any time. A database's own policy changes that:
+
+```bash
+curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET" \
+  -d '{"retention_hours": 168, "manual_every_seconds": 60, "manual_keep": 10}'
+# {"name": "notes", "policy": {"retention_hours": 168, "manual_every_seconds": 60, "manual_keep": 10}}
+```
+
+- `retention_hours` keeps every backup taken in that many hours, plus the
+  newest scheduled one from before, where the window's history starts, so a
+  database can always be restored to any moment in the window. Backups age out
+  on the schedule even while the database is unchanged, and the newest one is
+  never deleted. Without it, backups are kept by count.
+- `manual_every_seconds` refuses a manual backup that comes sooner than that
+  after the last one: `429` with `retry-after`.
+- `manual_keep` keeps at most that many of the backups asked for (manual ones,
+  and those a restore in place takes), newest first.
+
+Each field is a positive number, or `null` for the default; a field left out
+keeps its value. The policy lives in `<name>.db-backups.json` beside the
+database and goes when the database is deleted. With WAL shipping on, only the
+server's own snapshots start a WAL generation, so pruning a backup someone
+asked for never cuts the point-in-time history.
 
 ## API
 
@@ -223,6 +251,7 @@ curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI
 | `POST` | `/v1/databases/{name}/tokens/rotate` | admin | revoke every token of the database and close its streams → `{"name", "token_generation"}` |
 | `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes", "taken_ms", "kind": "manual"}` |
 | `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, the point-in-time window and the backups' `status` |
+| `PATCH` | `/v1/databases/{name}/backups` | admin | change the backup policy: `{"retention_hours", "manual_every_seconds", "manual_keep"}` |
 | `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
 | `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |

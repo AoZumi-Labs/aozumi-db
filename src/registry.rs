@@ -1,7 +1,8 @@
 //! Database name → open database. Each database is one file in the data
 //! directory, opened once and shared by every connection to it, with its
-//! limits beside it in `<name>.db-limits.json` and its token generation in
-//! `<name>.tokens.json`, which outlives the database (`rotate_tokens`).
+//! limits beside it in `<name>.db-limits.json`, its backup policy in
+//! `<name>.db-backups.json`, and its token generation in `<name>.tokens.json`,
+//! which outlives the database (`rotate_tokens`).
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
@@ -14,7 +15,7 @@ use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
 use crate::engine::{self, Conn, ConnOptions, Db, Synchronous, WalPosition};
-use crate::limits::{Limits, LimitsPatch};
+use crate::limits::{BackupPolicy, BackupPolicyPatch, Limits, LimitsPatch};
 use crate::proto::Value;
 
 /// How long a snapshot waits for in-flight writes before giving up.
@@ -28,6 +29,7 @@ pub struct Fingerprint(Vec<(u64, SystemTime)>);
 pub struct OpenDb {
     pub db: Db,
     pub limits: Limits,
+    pub backup_policy: BackupPolicy,
     /// Tokens minted below this generation are refused (`rotate_tokens`).
     pub token_generation: u64,
     pub page_size: u64,
@@ -276,6 +278,21 @@ impl Registry {
         Ok(limits)
     }
 
+    /// Change a database's backup policy.
+    pub async fn set_backup_policy(&self, name: &str, patch: &BackupPolicyPatch) -> Result<BackupPolicy, RegistryError> {
+        // Opened first, so it is in the registry; then read, changed and
+        // written under it, so two changes at once both land.
+        self.open(name, false).await?;
+        let mut open = self.open.lock().await;
+        let Some(db) = open.get_mut(name) else { return Err(RegistryError::NotFound) };
+        let policy = db.backup_policy.apply(patch).map_err(RegistryError::InvalidLimits)?;
+        let partial = self.dir.join(format!(".{name}.backups"));
+        tokio::fs::write(&partial, serde_json::to_vec(&policy)?).await?;
+        tokio::fs::rename(&partial, self.backup_policy_path(name)).await?;
+        db.backup_policy = policy;
+        Ok(policy)
+    }
+
     /// Revoke every token of a database: its token generation goes up by
     /// one, and tokens minted below it are refused from now on. Deleting a
     /// database keeps its generation, so a revoked token stays revoked for a
@@ -397,6 +414,11 @@ impl Registry {
         let path = self.path(name);
         let synchronous = self.synchronous;
         let token_generation = self.read_token_generation(name).await?;
+        let backup_policy = match tokio::fs::read(self.backup_policy_path(name)).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(err) if err.kind() == ErrorKind::NotFound => BackupPolicy::default(),
+            Err(err) => return Err(err.into()),
+        };
         tokio::task::spawn_blocking(move || {
             let db = engine::open(&path)?;
             let result = Conn::open(&db, &ConnOptions::default())?.execute("PRAGMA page_size", &[], &[], true)?;
@@ -404,7 +426,7 @@ impl Registry {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, token_generation, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
+            Ok(OpenDb { db, limits, backup_policy, token_generation, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
         })
         .await?
     }
@@ -442,6 +464,11 @@ impl Registry {
 
     fn limits_path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.db-limits.json"))
+    }
+
+    /// Named like the database's other side files, so it goes with it.
+    fn backup_policy_path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}.db-backups.json"))
     }
 }
 
