@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 
 pub use auth::{mint as mint_token, Claims};
 pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
-use backup::{BackupError, Backups, Kind};
+use backup::{BackupError, BackupInfo, Backups, Kind};
 use proto::{PipelineReq, PipelineResp};
 pub use engine::Synchronous;
 pub use limits::{BackupPolicy, Limits};
@@ -173,6 +173,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                 },
                 (&Method::GET, [name, "backups"]) => list_backups(&state, name).await,
                 (&Method::PATCH, [name, "backups"]) => update_backup_policy(&state, name, req).await,
+                (&Method::POST, [name, "restore"]) => restore_in_place(&state, name, req).await,
                 _ => text(StatusCode::NOT_FOUND, "not found"),
             }
         }
@@ -243,8 +244,12 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
 
     // Writers queue in arrival order; reads, and streams already holding a
     // transaction, go straight through.
+    let mut db = db;
     let turn = match stream.may_write(&msg.requests) && !stream.in_transaction() {
-        true => Some(db.writers.clone().lock_owned().await),
+        true => match writer_turn(state, &database, &mut db, &mut stream, msg.baton.is_none(), read_only).await {
+            Ok(turn) => Some(turn),
+            Err(resp) => return resp,
+        },
         false => None,
     };
     // Statements block on disk and CPU, so they run on the blocking pool.
@@ -273,7 +278,11 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
             // again under its name keeps its token generation, not its file.
             let (generation, file) = (stream.token_generation, stream.file.clone());
             let baton = state.streams.park(stream).await;
-            let current = state.registry.open(&database, false).await.is_ok_and(|now| now.token_generation <= generation && Arc::ptr_eq(&now.db, &file));
+            let current = state
+                .registry
+                .open(&database, false)
+                .await
+                .is_ok_and(|now| now.token_generation <= generation && Arc::ptr_eq(&now.db, &file) && !now.is_closing());
             // Looking can wait on the registry for longer than the idle
             // timeout (a restore holds it while it checks the whole copy), and
             // the idle reaper may drop the stream meanwhile: the baton goes
@@ -336,8 +345,12 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     };
     // A read-write console request takes its turn with the app's writers,
     // whatever its SQL: the person asked to write.
+    let mut db = db;
     let turn = match read_only {
-        false => Some(db.writers.clone().lock_owned().await),
+        false => match writer_turn(state, &database, &mut db, &mut stream, true, read_only).await {
+            Ok(turn) => Some(turn),
+            Err(resp) => return resp,
+        },
         true => None,
     };
     let started = Instant::now();
@@ -416,6 +429,35 @@ async fn console_read<T: Send + 'static>(
     })
 }
 
+/// Take the database's writer turn. When the database was deleted or
+/// restored in place while this request waited, its file is gone: a stream
+/// this request opened moves to the database that has the name now, and a
+/// stream from an earlier request (a baton) ends, as it would at its next
+/// request. No write lands on a file that was replaced.
+async fn writer_turn(
+    state: &State,
+    database: &str,
+    db: &mut registry::OpenDb,
+    stream: &mut Stream,
+    fresh: bool,
+    read_only: bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, Resp> {
+    for _ in 0..3 {
+        let turn = db.writers.clone().lock_owned().await;
+        if !db.is_closing() {
+            return Ok(turn);
+        }
+        drop(turn);
+        if !fresh {
+            return Err(text(StatusCode::BAD_REQUEST, "unknown or expired baton"));
+        }
+        let now = state.registry.open(database, false).await.map_err(registry_error)?;
+        *stream = open_stream(database, &now, read_only)?;
+        *db = now;
+    }
+    Err(text(StatusCode::SERVICE_UNAVAILABLE, "the database is being replaced; try again"))
+}
+
 fn open_stream(database: &str, db: &registry::OpenDb, read_only: bool) -> Result<Stream, Resp> {
     let conn = db
         .checkout(BUSY_TIMEOUT, read_only)
@@ -476,7 +518,7 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
                     }),
                     Err(err) => Err(err),
                 },
-                (None, Some(id)) => state.backups.fetch(&from.database, id).await,
+                (None, Some(id)) => state.backups.fetch(&from.database, id).await.map(|(bytes, _)| bytes),
                 (None, None) => return text(StatusCode::BAD_REQUEST, "a restore needs `backup` or `at`"),
             };
             match fetched {
@@ -525,6 +567,89 @@ async fn list_backups(state: &State, name: &str) -> Resp {
         Ok(listing) => json(StatusCode::OK, &listing),
         Err(err) => backup_error(err),
     }
+}
+
+/// Restore a database in place: `{"backup": id | "latest"}` or `{"at": time}`
+/// → `{"name", "restored_to_ms", "before_restore": backup}` (D26). The
+/// database keeps its name, tokens, limits and backup policy.
+async fn restore_in_place(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+    #[derive(Deserialize)]
+    struct Body {
+        backup: Option<String>,
+        at: Option<serde_json::Value>,
+    }
+    let body: Body = match read_json(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    if let Err(err) = state.registry.open(name, false).await {
+        return registry_error(err);
+    }
+    // The backup is read first: a backup that cannot be read changes nothing.
+    let fetched = match (&body.at, &body.backup) {
+        (Some(at), _) => match backup::parse_time(at) {
+            Ok(at) => state.backups.fetch_at(name, at).await.map(|restored| (restored.bytes, restored.restored_to_ms)),
+            Err(err) => Err(err),
+        },
+        (None, Some(id)) => state.backups.fetch(name, id).await.map(|(bytes, info)| (bytes, info.taken_ms)),
+        (None, None) => return text(StatusCode::BAD_REQUEST, "a restore needs `backup` or `at`"),
+    };
+    let (bytes, restored_to_ms) = match fetched {
+        Ok(fetched) => fetched,
+        Err(err) => return backup_error(err),
+    };
+    match replace_with_backup(state, name, bytes).await {
+        Ok(before) => json(StatusCode::OK, &json!({"name": name, "restored_to_ms": restored_to_ms, "before_restore": before})),
+        Err(err) => backup_error(err),
+    }
+}
+
+/// The restore in place itself. The copy is written and checked without any
+/// lock. Then, holding the database's backup lock and its writer turn, it
+/// ends the database's open transactions, takes the write lock on the old
+/// file and copies it, stores that copy as the `before_restore` backup (and
+/// stops, changing nothing, if it cannot), and swaps the file. Writes wait
+/// meanwhile; reads go on. A write that waited lands in the restored file.
+async fn replace_with_backup(state: &State, name: &str, bytes: Vec<u8>) -> Result<BackupInfo, BackupError> {
+    let staged = state.registry.stage(name, bytes).await?;
+    let lock = state.backups.lock(name);
+    let _backing_up = lock.lock().await;
+    let old = match state.registry.open(name, false).await {
+        Ok(db) => db,
+        Err(err) => {
+            staged.remove().await;
+            return Err(err.into());
+        }
+    };
+    let turn = old.writers.clone().lock_owned().await;
+    old.set_closing(true);
+    // A parked transaction would hold the write lock until it idled out.
+    state.streams.close_database(name).await;
+    let held = match state.registry.hold(name, &old).await {
+        Ok(held) => held,
+        Err(err) => {
+            old.set_closing(false);
+            staged.remove().await;
+            return Err(err.into());
+        }
+    };
+    let (held, before) = state.backups.store_before_restore(&state.registry, name, held).await;
+    let before = match before {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tokio::task::spawn_blocking(move || held.release()).await;
+            old.set_closing(false);
+            staged.remove().await;
+            return Err(err);
+        }
+    };
+    let replaced = state.registry.replace(name, staged).await;
+    let _ = tokio::task::spawn_blocking(move || held.release()).await;
+    drop(turn);
+    state.streams.close_database(name).await;
+    state.backups.forget_generation(name).await;
+    replaced?;
+    Ok(before)
 }
 
 /// `{"retention_hours", "manual_every_seconds", "manual_keep"}`, each a

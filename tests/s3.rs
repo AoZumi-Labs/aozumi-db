@@ -262,6 +262,30 @@ async fn a_failing_store_shows_in_the_status_until_a_backup_succeeds() {
     assert_eq!(listed["status"]["last_backup_ms"], backup["taken_ms"], "{listed}");
 }
 
+#[tokio::test]
+async fn a_restore_in_place_that_cannot_store_its_undo_backup_changes_nothing() {
+    let (addr, fake) = fake_s3().await;
+    let target = BackupTarget::s3(options(addr, "backups", static_key())).unwrap();
+    let server = TestServer::with_backup_target(target, 5, None).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    let (status, body) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
+
+    fake.lock().unwrap().fail_puts = true;
+    let (status, body) = server.admin(Method::POST, "/v1/databases/app/restore", Some(json!({"backup": "latest"}))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+    // The database is as it was, and takes writes again.
+    let results = server.run(Some(&app), vec![execute("SELECT count(*) FROM t"), execute("INSERT INTO t VALUES (3)")]).await;
+    assert_eq!(scalar(&results), "2");
+    assert_eq!(results[1]["type"], "ok", "{}", results[1]);
+    let (_, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
+    assert_eq!(listed["backups"].as_array().unwrap().len(), 1, "{listed}");
+    assert!(listed["status"]["last_failure"]["message"].as_str().unwrap().contains("InternalError"), "{listed}");
+}
+
 #[test]
 fn backup_urls_parse() {
     assert!(BackupTarget::parse("s3://bucket/some/prefix").is_ok());

@@ -161,7 +161,23 @@ curl -X POST localhost:8080/v1/databases -H "authorization: Bearer $AOZUMI_DB_SE
 Restores never overwrite a live database. A new machine pointed at the same
 backup store can restore every database it finds there.
 
-To restore in place, delete the database, then restore it under its own name.
+### Restoring in place
+
+```bash
+curl -X POST localhost:8080/v1/databases/notes/restore -H "authorization: Bearer $AOZUMI_DB_SECRET" \
+  -d '{"backup": "latest"}'            # or {"at": "2026-10-26T09:30:00Z"}
+# {"name": "notes", "restored_to_ms": 1793000000000,
+#  "before_restore": {"id": "1793000060000", "size_bytes": 8192, "taken_ms": 1793000060000, "kind": "before_restore"}}
+```
+
+The database keeps its name, tokens, limits and backup policy; apps carry on
+with the restored data. It first stores what it replaces as a
+`before_restore` backup, so restoring that backup undoes the restore; when it
+cannot store it, nothing changes. Writes wait while it runs (seconds for a
+large database), reads go on, and a write that waited lands in the restored
+database. Its open transactions end: their streams close, rolling back.
+
+Deleting a database and restoring a backup under its old name works too.
 Deleting closes the database's open streams, rolling back their transactions,
 so no app carries on with the deleted copy. A stream busy with a request at
 that moment closes when the request finishes: its response carries no baton.
@@ -254,6 +270,7 @@ asked for never cuts the point-in-time history.
 | `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes", "taken_ms", "kind": "manual"}` |
 | `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, the point-in-time window and the backups' `status` |
 | `PATCH` | `/v1/databases/{name}/backups` | admin | change the backup policy: `{"retention_hours", "manual_every_seconds", "manual_keep"}` |
+| `POST` | `/v1/databases/{name}/restore` | admin | restore in place from `{"backup"}` or `{"at"}` → `{"name", "restored_to_ms", "before_restore"}` |
 | `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
 | `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |

@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::engine::{Conn, WalPosition, FRAME_HEADER};
 use crate::limits::BackupPolicy;
-use crate::registry::{Fingerprint, OpenDb, Registry, RegistryError};
+use crate::registry::{Fingerprint, Held, OpenDb, Registry, RegistryError};
 
 pub use s3::{Credentials, S3Options};
 use s3::S3;
@@ -362,7 +362,9 @@ impl Backups {
         self.config.as_ref().ok_or(BackupError::NotConfigured)
     }
 
-    fn lock(&self, db: &str) -> Arc<Mutex<()>> {
+    /// Held by every snapshot, WAL shipping round and restore in place of
+    /// one database, so they never overlap.
+    pub fn lock(&self, db: &str) -> Arc<Mutex<()>> {
         self.locks.lock().unwrap().entry(db.to_string()).or_default().clone()
     }
 
@@ -413,6 +415,44 @@ impl Backups {
         }
         self.prune(db, &policy).await?;
         Ok(info)
+    }
+
+    /// A database was restored in place: its WAL is new, so shipping starts
+    /// a new generation, and the schedule backs it up as changed.
+    pub async fn forget_generation(&self, db: &str) {
+        self.cursors.lock().await.remove(db);
+        self.seen.lock().await.remove(db);
+    }
+
+    /// Store the backup a restore in place takes just before it replaces the
+    /// database, from the copy `held` made. Hands `held` back either way.
+    pub async fn store_before_restore(&self, registry: &Registry, db: &str, held: Held) -> (Held, Result<BackupInfo, BackupError>) {
+        let started = now_ms();
+        let (held, bytes) = match tokio::task::spawn_blocking(move || {
+            let bytes = held.backup_bytes();
+            (held, bytes)
+        })
+        .await
+        {
+            Ok(done) => done,
+            Err(err) => panic!("folding the copy for a restore panicked: {err}"),
+        };
+        let stored = async {
+            let config = self.config()?;
+            let policy = registry.open(db, false).await?.backup_policy;
+            let bytes = bytes?;
+            let id = self.next_id().await;
+            let info = BackupInfo::new(id.clone(), bytes.len() as u64, Kind::BeforeRestore);
+            config.target.put(&snapshot_key(db, &id, Kind::BeforeRestore), bytes).await?;
+            self.prune(db, &policy).await?;
+            Ok(info)
+        }
+        .await;
+        match &stored {
+            Ok(_) => self.record_stored(db, started),
+            Err(err) => self.record_failure(db, err),
+        }
+        (held, stored)
     }
 
     /// Stop shipping a deleted database's WAL, and forget how its backups went.
@@ -480,8 +520,8 @@ impl Backups {
         Ok(Some(Window { earliest_ms: oldest.taken_ms, latest_ms: shipped.max(newest.taken_ms) }))
     }
 
-    /// The bytes of a snapshot; `id` may be `latest`.
-    pub async fn fetch(&self, db: &str, id: &str) -> Result<Vec<u8>, BackupError> {
+    /// The bytes of a snapshot, and which it is; `id` may be `latest`.
+    pub async fn fetch(&self, db: &str, id: &str) -> Result<(Vec<u8>, BackupInfo), BackupError> {
         // The name becomes part of a path in the store; checked before any read.
         if !crate::registry::valid_name(db) {
             return Err(RegistryError::InvalidName.into());
@@ -496,7 +536,8 @@ impl Backups {
             id => snapshots.iter().find(|s| s.id == id),
         }
         .ok_or(BackupError::NotFound)?;
-        target.get(&snapshot_key(db, &found.id, found.kind)).await?.ok_or(BackupError::NotFound)
+        let bytes = target.get(&snapshot_key(db, &found.id, found.kind)).await?.ok_or(BackupError::NotFound)?;
+        Ok((bytes, found.clone()))
     }
 
     /// The database as it was at `at_ms`: the newest snapshot at or before

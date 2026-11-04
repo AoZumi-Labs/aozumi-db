@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -38,6 +39,11 @@ pub struct OpenDb {
     pub writers: Arc<Mutex<()>>,
     /// Idle connections, reused instead of opened per request.
     pub pool: Arc<Pool>,
+    /// Set once the database's file is going away: deleted, or replaced by a
+    /// restore in place (set while that runs, and cleared if it fails). A
+    /// request that waited for its writer turn looks the database up again
+    /// instead of writing to it, and a stream on it ends with its request.
+    closing: Arc<AtomicBool>,
     synchronous: Synchronous,
 }
 
@@ -101,6 +107,50 @@ impl OpenDb {
     /// Settings for the server's own connections: no tenant limits.
     pub fn internal_options(&self) -> ConnOptions {
         ConnOptions { synchronous: self.synchronous, ..Default::default() }
+    }
+
+    /// The database's file is going away (see `closing`).
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::Release);
+    }
+}
+
+/// A restored copy of a database, written and checked in a scratch
+/// directory, ready to move into place.
+pub struct Staged {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl Staged {
+    pub async fn remove(self) {
+        let _ = tokio::fs::remove_dir_all(&self.dir).await;
+    }
+}
+
+/// A database held still for a restore in place: its write lock taken on a
+/// connection of its own, and its files copied while held.
+pub struct Held {
+    conn: Conn,
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl Held {
+    /// The copy, folded into one file: the backup taken before the restore. Blocks.
+    pub fn backup_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        fold_copy(&self.file)
+    }
+
+    /// Give the write lock back and remove the copy. Blocks.
+    pub fn release(self) {
+        let _ = self.conn.execute_script("ROLLBACK");
+        drop(self.conn);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -213,6 +263,87 @@ impl Registry {
         // The engine creates the file lazily; a first statement makes it real.
         Conn::open(&db.db, &db.internal_options())?.execute_script("PRAGMA user_version = 0")?;
         self.write_limits(name, &limits).await?;
+        open.insert(name.to_string(), db);
+        Ok(())
+    }
+
+    /// Write the bytes of a backup to a scratch directory and check them,
+    /// without the registry, so a large restore holds up no other database.
+    pub async fn stage(&self, name: &str, bytes: Vec<u8>) -> Result<Staged, RegistryError> {
+        if !valid_name(name) {
+            return Err(RegistryError::InvalidName);
+        }
+        let dir = self.dir.join(".tmp").join(format!("{name}-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&dir).await?;
+        let staged = Staged { file: dir.join(format!("{name}.db")), dir };
+        let checked = async {
+            tokio::fs::write(&staged.file, bytes).await?;
+            let file = staged.file.clone();
+            tokio::task::spawn_blocking(move || quick_check(&file)).await??;
+            anyhow::Ok(())
+        }
+        .await;
+        match checked {
+            Ok(()) => Ok(staged),
+            Err(err) => {
+                staged.remove().await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Take a database's write lock on a connection of its own, waiting for
+    /// a transaction in the middle of a request, and copy its files while
+    /// holding it, into a scratch directory named `<name>-before-…`.
+    pub async fn hold(&self, name: &str, db: &OpenDb) -> Result<Held, RegistryError> {
+        let work = self.dir.join(".tmp").join(format!("{name}-before-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&work).await?;
+        let (db, dir, file) = (db.clone(), self.dir.clone(), format!("{name}.db"));
+        let held = tokio::task::spawn_blocking({
+            let work = work.clone();
+            move || {
+                let conn = Conn::open(&db.db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT, ..db.internal_options() })?;
+                conn.execute_script("BEGIN IMMEDIATE")?;
+                match copy_files(&dir, &file, &work) {
+                    Ok(()) => anyhow::Ok(Held { conn, file: work.join(&file), dir: work }),
+                    Err(err) => {
+                        let _ = conn.execute_script("ROLLBACK");
+                        Err(err)
+                    }
+                }
+            }
+        })
+        .await?;
+        if held.is_err() {
+            let _ = tokio::fs::remove_dir_all(&work).await;
+        }
+        Ok(held?)
+    }
+
+    /// Replace a database's file with a staged copy, keeping its limits,
+    /// backup policy and token generation. Its WAL goes first, so it is
+    /// never replayed onto the copy. The old file closes: connections still
+    /// on it keep it until they end, and nothing new opens on it.
+    pub async fn replace(&self, name: &str, staged: Staged) -> Result<(), RegistryError> {
+        let mut open = self.open.lock().await;
+        let Some(old) = open.remove(name) else {
+            staged.remove().await;
+            return Err(RegistryError::NotFound);
+        };
+        old.set_closing(true);
+        let placed = async {
+            for suffix in ["-wal", "-tshm"] {
+                match tokio::fs::remove_file(self.dir.join(format!("{name}.db{suffix}"))).await {
+                    Err(err) if err.kind() != ErrorKind::NotFound => return Err(err.into()),
+                    _ => {}
+                }
+            }
+            tokio::fs::rename(&staged.file, self.path(name)).await?;
+            self.build(name, old.limits).await
+        }
+        .await;
+        staged.remove().await;
+        let db = placed?;
         open.insert(name.to_string(), db);
         Ok(())
     }
@@ -345,7 +476,9 @@ impl Registry {
         if !tokio::fs::try_exists(self.path(name)).await? {
             return Err(RegistryError::NotFound);
         }
-        open.remove(name);
+        if let Some(old) = open.remove(name) {
+            old.set_closing(true);
+        }
         self.remove_files(name).await?;
         Ok(())
     }
@@ -428,7 +561,17 @@ impl Registry {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
-            Ok(OpenDb { db, limits, backup_policy, token_generation, page_size, writers: Arc::new(Mutex::new(())), pool: Arc::default(), synchronous })
+            Ok(OpenDb {
+                db,
+                limits,
+                backup_policy,
+                token_generation,
+                page_size,
+                writers: Arc::new(Mutex::new(())),
+                pool: Arc::default(),
+                closing: Arc::default(),
+                synchronous,
+            })
         })
         .await?
     }
@@ -520,20 +663,29 @@ fn snapshot_files(db: &OpenDb, dir: &std::path::Path, file: &str, work: &std::pa
     let copied = (|| {
         // Taken under the write lock: exactly what the copy will contain.
         let wal = conn.wal_position()?;
-        for suffix in ["", "-wal"] {
-            let from = dir.join(format!("{file}{suffix}"));
-            if from.exists() {
-                std::fs::copy(&from, work.join(format!("{file}{suffix}")))?;
-            }
-        }
+        copy_files(dir, file, work)?;
         anyhow::Ok(wal)
     })();
     conn.execute_script("ROLLBACK")?;
     let wal = copied?;
+    Ok(Snapshot { bytes: fold_copy(&work.join(file))?, wal })
+}
 
-    let copy = work.join(file);
-    let snapshot = engine::open(&copy)?;
+/// Copy a database's file and its WAL into `work`. Call holding its write lock. Blocks.
+fn copy_files(dir: &Path, file: &str, work: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal"] {
+        let from = dir.join(format!("{file}{suffix}"));
+        if from.exists() {
+            std::fs::copy(&from, work.join(format!("{file}{suffix}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fold a copied database's WAL into its file, and read the file. Blocks.
+fn fold_copy(copy: &Path) -> anyhow::Result<Vec<u8>> {
+    let snapshot = engine::open(copy)?;
     snapshot.connect()?.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
     drop(snapshot);
-    Ok(Snapshot { bytes: std::fs::read(&copy)?, wal })
+    Ok(std::fs::read(copy)?)
 }
