@@ -19,6 +19,10 @@ use it:
 cargo run --release --example bench -- ycsb ABCDEF --records 100000 --clients 32 --seconds 10
 cargo run --release --example bench -- latency --rate 1000 --clients 32 --seconds 10
 cargo run --release --example bench -- micro --clients 32 --seconds 5
+# as production runs it: checked tokens, backups, the WAL shipped every 5 s
+cargo run --release --example bench -- micro --clients 32 --seconds 5 --prod
+# a server elsewhere
+cargo run --release --example bench -- micro --url https://db.example.com --token "$TOKEN"
 ```
 
 The server runs in the benchmark process on 4 threads and the clients on
@@ -101,6 +105,91 @@ What is left on the table: the server reaches about a third of the bare
 engine's single-thread point-read rate on a shared 6-core laptop where the
 clients run too. Next: a quiet machine for numbers worth publishing, TATP,
 and profiling the read path (JSON encoding, the blocking-pool hop).
+
+## The path apps use (2026-11-04)
+
+The numbers above run client and server in one process. What an app sees
+also includes the network in front of the server. Two probes measure it with
+the requests `@libsql/client` sends (`POST /v2/pipeline` with `execute` and
+`close`), one request at a time over a kept-alive connection:
+
+- `bench/probe/pipeline-latency.mjs` (Node's `fetch`): from where an app
+  runs.
+- `bench/probe/pipeline-latency.py` (Python's standard library only): on the
+  server's own machine, against its loopback, to see the server alone.
+
+Both use one table of 10,000 rows (`--setup` makes it) and print JSON.
+
+AOZUMI's hosted server, release 289c07c: a 2-vCPU ARM VM (AWS t4g.small,
+EBS gp3, ext4) behind a Cloudflare tunnel. The app side was a 0.5-vCPU ARM
+container (AWS Fargate) in the same availability zone, Node 22. The VM was
+idle (load 0.00) with one database.
+
+| Per request, ms | from the app, p50 / p99 | on the server's loopback, p50 / p99 | network's share of p50 |
+|---|---:|---:|---:|
+| `GET /health` | 11.33 / 26.07 | 0.17 / 0.28 | 11.2 |
+| point read | 10.90 / 16.87 | 0.30 / 0.41 | 10.6 (97%) |
+| single-row insert | 14.03 / 32.19 | 3.57 / 4.35 | 10.5 (75%) |
+| 10-row transaction | 13.85 / 18.45 | 3.69 / 4.91 | 10.2 (73%) |
+| point reads, 8 clients, 10 s | 594 ops/s, p50 10.9, p99 57.8 | | |
+
+What this shows:
+
+- **The tunnel is most of every request.** A point read takes 0.30 ms on the
+  server and 10.9 ms from the app, and 8 clients get 594 reads/s. A path
+  inside the network, without the tunnel, is where most of the time is.
+- **Writes are a flush.** A commit of one row costs what a commit of ten does
+  (3.57 vs 3.69 ms). With `synchronous = FULL`, each commit waits for the
+  disk.
+
+A flush on that volume, 200 writes of one 4,120-byte WAL frame each:
+
+| Pattern | p50 | p99 |
+|---|---:|---:|
+| append + `fsync` (the WAL grows after each truncating checkpoint) | 3.05 ms | 3.32 ms |
+| overwrite in place + `fsync` | 2.81 ms | 3.05 ms |
+| append + `fdatasync` | 3.02 ms | 3.41 ms |
+| overwrite in place + `fdatasync` | 0.94 ms | 1.06 ms |
+
+Every commit appends to the WAL, and flushing an append also commits the
+file system's journal: the 3 ms rows. `fdatasync` skips that only for an
+overwrite, and the engine never overwrites the WAL: it empties the file at a
+truncating checkpoint, and after a restarting one it cuts it back to its
+header at the next write. So the server cannot get the 0.94 ms row by
+itself, and syncing with `fdatasync` instead changes nothing (below).
+
+### The write path on the server's kind of volume (2026-11-04)
+
+What does shorten an append's flush is the file system. A throwaway machine
+of the same kind as AOZUMI's (AWS Graviton2, 2 vCPUs, Ubuntu 24.04 with
+kernel 7.0, EBS gp3, ext4 `noatime`) had two identical 20 GB volumes, one
+plain ext4 and one formatted with ext4's `fast_commit`, which journals a
+small change such as an append in a block of its own. On each, the flush
+probe, then `micro --clients 8 --seconds 5` and `latency --prod`, built from
+this tree, two rounds:
+
+| | plain ext4 | ext4 `fast_commit` | change |
+|---|---:|---:|---:|
+| flush, append + `fsync`, p50 | 2.91 / 2.92 ms | 1.88 / 1.88 ms | −35% |
+| flush, append + `fdatasync`, p50 | 2.96 / 2.92 ms | 1.88 / 1.86 ms | −36% |
+| flush, overwrite + `fdatasync`, p50 | 0.96 / 0.94 ms | 0.97 / 0.96 ms | none |
+| single-row inserts/s, 8 clients | 308 / 309 | 471 / 470 | +53% |
+| 100-row transactions/s, 8 clients | 249 / 250 | 352 / 352 | +41% |
+| point reads/s, 8 clients | 19,378 / 19,205 | 20,092 / 19,192 | none |
+| one writer at 100 commits/s, p50 / p99 | 4.40 / 5.15 ms, 4.39 / 5.15 ms | 3.59 / 4.21 ms, 3.54 / 4.22 ms | −19% / −18% |
+| one writer at 100 commits/s, p99.9 | 15.66, 8.62 ms | 5.30, 5.82 ms | about −55% |
+| 8 connections at 200 commits/s, p50 / p99 | 4.97 / 6.07 ms, 4.36 / 5.43 ms | 3.05 / 3.83 ms, 3.02 / 3.70 ms | −35% / −34% |
+
+A trial build that synced the WAL with `fdatasync` instead of `fsync`
+landed within a few percent of these numbers on both volumes (308 inserts/s
+on plain ext4, 467 to 472 on `fast_commit`), so the server keeps `fsync`.
+`fast_commit` is a setting of the volume, not of the server; durability is
+the same, as each `fsync` still returns only once the commit is on the disk.
+
+The YCSB harness runs the server in dev mode by default: no token check, no
+backups. `--prod` runs it with production's settings instead (checked
+tokens, backups with the WAL shipped every 5 s), and `--url … --token …`
+points it at a server elsewhere.
 
 ## Head-to-head with libSQL's server (2026-10-26)
 
