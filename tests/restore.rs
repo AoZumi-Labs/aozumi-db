@@ -141,6 +141,7 @@ async fn an_open_transaction_ends_and_does_not_hold_up_the_restore() {
         keep: 10,
         every: None,
         wal_every: None,
+        prune_every: PRUNE_EVERY,
     };
     // Streams idle long enough that waiting for one to time out would show.
     let server = TestServer::with_secret_and(move |c| {

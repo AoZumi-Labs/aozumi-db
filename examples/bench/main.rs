@@ -4,10 +4,11 @@
 //!     cargo run --release --example bench -- latency [--rate N] [--clients N] [--seconds N]
 //!     cargo run --release --example bench -- micro [--clients N] [--seconds N]
 //!
-//! Add `--url http://host:port` to benchmark a server running elsewhere
-//! instead of one in this process: another aozumi-db, or any server that
-//! speaks libSQL's HTTP protocol (such as libSQL's own server), against an
-//! empty database; add `--token <token>` when it needs one.
+//! Add `--url http://host:port` (or `https://`) to benchmark a server
+//! running elsewhere instead of one in this process: another aozumi-db, or
+//! any server that speaks libSQL's HTTP protocol (such as libSQL's own
+//! server), against an empty database; add `--token <token>` when it needs
+//! one.
 //!
 //! Add `--prod` to run the in-process server as production runs it: a
 //! secret, so every request's token is checked; backups to a directory, a
@@ -46,7 +47,7 @@ use hyper_util::rt::TokioExecutor;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
 
-type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
+type HttpClient = Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>;
 
 struct Args {
     mode: String,
@@ -201,6 +202,7 @@ fn production_config(dir: &std::path::Path) -> aozumi_db::Config {
         keep: 48,
         every: Some(Duration::from_secs(3600)),
         wal_every: Some(Duration::from_secs(5)),
+        prune_every: Duration::from_secs(300),
     });
     config.default_limits = aozumi_db::Limits { max_size_bytes: Some(268_435_456), max_statement_ms: Some(5000), max_requests_per_second: None };
     config
@@ -249,8 +251,10 @@ fn failed_cell(failed: u64, succeeded: usize) -> String {
     }
 }
 
+/// Plain HTTP, or HTTPS checked against the web PKI's roots for `--url https://…`.
 fn new_client() -> HttpClient {
-    Client::builder(TokioExecutor::new()).pool_max_idle_per_host(1).build_http()
+    let connector = hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots().https_or_http().enable_http1().build();
+    Client::builder(TokioExecutor::new()).pool_max_idle_per_host(1).build(connector)
 }
 
 /// A request with no answer by then counts as failed, so a server that
