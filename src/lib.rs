@@ -662,7 +662,7 @@ async fn replace_with_backup(state: &State, name: &str, bytes: Vec<u8>) -> Resul
             return Err(err);
         }
     };
-    let replaced = state.registry.replace(name, staged).await;
+    let replaced = state.registry.replace(name, &old, staged).await;
     let _ = tokio::task::spawn_blocking(move || held.release()).await;
     drop(turn);
     state.streams.close_database(name).await;
@@ -770,6 +770,7 @@ fn registry_error(err: RegistryError) -> Resp {
         RegistryError::InvalidLimits(message) => text(StatusCode::BAD_REQUEST, &message),
         RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
         RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
+        RegistryError::Changed => text(StatusCode::CONFLICT, "the database was deleted or made again meanwhile; nothing was replaced"),
         RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),
     }
 }

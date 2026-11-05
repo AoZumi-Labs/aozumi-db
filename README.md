@@ -176,7 +176,9 @@ with the restored data. It first stores what it replaces as a
 cannot store it, nothing changes. Writes wait while it runs (seconds for a
 large database), reads go on, and a write that waited lands in the restored
 database. Its open transactions end: their streams close, rolling back.
-Once started, a restore runs to its end even if the client hangs up.
+Once started, a restore runs to its end even if the client hangs up. A
+database deleted while it ran, and perhaps made again under the name, is left
+as it is: the restore answers `409` and replaces nothing.
 
 Deleting a database and restoring a backup under its old name works too.
 Deleting closes the database's open streams, rolling back their transactions,
