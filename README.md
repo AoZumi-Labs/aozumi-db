@@ -182,6 +182,31 @@ exactly which moment the copy holds. Listing a database's backups also
 reports `point_in_time.earliest_ms` and `latest_ms`, the window you can
 restore from.
 
+### How a database's backups are going
+
+Listing a database's backups also tells you when and why each one was taken,
+and how its backups are going:
+
+```bash
+curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET"
+# {"backups": [{"id": "1793000000000", "size_bytes": 8192, "taken_ms": 1793000000000, "kind": "manual"}, ...],
+#  "point_in_time": {"earliest_ms": ..., "latest_ms": ...},
+#  "status": {"every_seconds": 300, "wal_every_ms": 1000, "keep": 24,
+#             "last_backup_ms": 1793000004120, "up_to_date_ms": 1793000005013, "last_failure": null}}
+```
+
+- `kind` is `scheduled` (taken by the server: its schedule, or WAL shipping
+  starting a new generation), `manual` (asked for with `POST .../backups`) or
+  `before_restore`. It is part of the backup's name in the store
+  (`<id>.db`, `<id>.manual.db`, `<id>.before-restore.db`); older servers skip
+  names they do not know and never delete them.
+- `last_backup_ms` is the newest snapshot or WAL segment in the store.
+- `up_to_date_ms` is the last moment the server saw every committed write
+  in the store. It is kept in memory, so it is `null` after a restart until
+  the next WAL shipping round or scheduled backup.
+- `last_failure` (`{"at_ms", "message"}`) is the last snapshot or WAL upload
+  that failed, until one succeeds again.
+
 ## API
 
 | Method | Path | Auth | |
@@ -196,8 +221,8 @@ restore from.
 | `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files |
 | `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` at the current token generation |
 | `POST` | `/v1/databases/{name}/tokens/rotate` | admin | revoke every token of the database and close its streams → `{"name", "token_generation"}` |
-| `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes"}` |
-| `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, and the point-in-time window |
+| `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes", "taken_ms", "kind": "manual"}` |
+| `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, the point-in-time window and the backups' `status` |
 | `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
 | `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |

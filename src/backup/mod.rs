@@ -1,8 +1,10 @@
 //! Backups and point-in-time restore.
 //!
 //! A snapshot is a consistent copy of a database as one file, stored as
-//! `<database>/<id>.db`; ids are zero-padded unix milliseconds, so they sort
-//! by age. With WAL shipping on, each snapshot also starts a generation: the
+//! `<database>/<id>.db`, or `<id>.manual.db` when it was asked for (see
+//! [`Kind`]); ids are zero-padded unix milliseconds, so they sort by age and
+//! say when the snapshot was taken. With WAL shipping on, each snapshot also
+//! starts a generation: the
 //! WAL frames committed after it, uploaded every few moments as segments
 //! `<database>/wal/<snapshot id>/<segment no>-<shipped at ms>.wal`. Restoring
 //! to a time takes the newest snapshot at or before it and replays the
@@ -108,9 +110,20 @@ impl BackupTarget {
                     Err(err) => return Err(err.into()),
                 };
                 while let Some(entry) = entries.next_entry().await? {
-                    let meta = entry.metadata().await?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // An upload in progress (`.<n>.partial`) is not an object
+                    // yet, and is renamed away at any moment.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let meta = match entry.metadata().await {
+                        Ok(meta) => meta,
+                        // Gone since the directory was read: pruned meanwhile.
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
                     if meta.is_file() {
-                        out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
+                        out.push((name, meta.len()));
                     }
                 }
             }
@@ -136,19 +149,102 @@ impl BackupTarget {
     }
 }
 
-fn snapshot_key(db: &str, id: &str) -> String {
-    format!("{db}/{id}.db")
+fn snapshot_key(db: &str, id: &str, kind: Kind) -> String {
+    format!("{db}/{id}{}", kind.suffix())
 }
 
 fn wal_dir(db: &str, generation: &str) -> String {
     format!("{db}/wal/{generation}/")
 }
 
+/// Why a snapshot was taken, kept in its object's name: servers that do not
+/// know a kind's name skip those snapshots, and never prune them.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// By the server: its schedule, or WAL shipping starting a generation.
+    Scheduled,
+    /// Asked for through the admin API.
+    Manual,
+    /// By a restore in place, just before it replaced the database.
+    BeforeRestore,
+}
+
+impl Kind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Kind::Scheduled => ".db",
+            Kind::Manual => ".manual.db",
+            Kind::BeforeRestore => ".before-restore.db",
+        }
+    }
+
+    /// The snapshot id and kind an object name holds.
+    fn parse(name: &str) -> Option<(&str, Kind)> {
+        [Kind::Manual, Kind::BeforeRestore, Kind::Scheduled]
+            .into_iter()
+            .find_map(|kind| name.strip_suffix(kind.suffix()).filter(|id| valid_id(id)).map(|id| (id, kind)))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BackupInfo {
     pub id: String,
     pub size_bytes: u64,
+    /// When it was taken, in unix milliseconds: the id as a number.
+    pub taken_ms: u64,
+    pub kind: Kind,
 }
+
+impl BackupInfo {
+    fn new(id: String, size_bytes: u64, kind: Kind) -> Self {
+        let taken_ms = id.parse().unwrap_or(0);
+        Self { id, size_bytes, taken_ms, kind }
+    }
+}
+
+/// A database's backups, the times it can be restored to, and how its
+/// backups are going: what `GET /v1/databases/<name>/backups` answers.
+#[derive(Debug, Serialize)]
+pub struct Listing {
+    pub backups: Vec<BackupInfo>,
+    pub point_in_time: Option<Window>,
+    pub status: Status,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Status {
+    /// How often a changed database is snapshotted; `None` = only on request.
+    pub every_seconds: Option<u64>,
+    /// How often committed WAL frames are shipped; `None` = no point-in-time restore.
+    pub wal_every_ms: Option<u64>,
+    /// Snapshots kept per database.
+    pub keep: usize,
+    /// The newest snapshot or WAL segment in the store.
+    pub last_backup_ms: Option<u64>,
+    /// Every write committed before this moment was in the store, as far as
+    /// this server has seen since it started.
+    pub up_to_date_ms: Option<u64>,
+    /// The last attempt to store a snapshot or WAL that failed, unless one
+    /// succeeded after it.
+    pub last_failure: Option<Failure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Failure {
+    pub at_ms: u64,
+    pub message: String,
+}
+
+/// What this server has seen of one database's backups since it started.
+#[derive(Debug, Default)]
+struct Health {
+    up_to_date_ms: Option<u64>,
+    last_failure: Option<Failure>,
+}
+
+/// Failure messages kept for the status are cut to this many characters.
+const FAILURE_MESSAGE_CHARS: usize = 500;
 
 /// The range of times a database can be restored to.
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +308,7 @@ pub struct Backups {
     cursors: Mutex<HashMap<String, Cursor>>,
     /// Snapshots and WAL shipping of one database never overlap.
     locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    health: std::sync::Mutex<HashMap<String, Health>>,
 }
 
 impl Backups {
@@ -222,7 +319,29 @@ impl Backups {
             seen: Mutex::new(HashMap::new()),
             cursors: Mutex::new(HashMap::new()),
             locks: std::sync::Mutex::new(HashMap::new()),
+            health: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Everything committed before `ms` is in the store.
+    fn mark_up_to_date(&self, db: &str, ms: u64) {
+        let mut health = self.health.lock().unwrap();
+        let entry = health.entry(db.to_string()).or_default();
+        entry.up_to_date_ms = Some(entry.up_to_date_ms.map_or(ms, |seen| seen.max(ms)));
+    }
+
+    /// Something new reached the store, and everything committed before `ms` is in it.
+    fn record_stored(&self, db: &str, ms: u64) {
+        self.mark_up_to_date(db, ms);
+        self.health.lock().unwrap().entry(db.to_string()).or_default().last_failure = None;
+    }
+
+    /// A snapshot or WAL upload failed. A database that is gone or a name
+    /// that is not valid is not a backup failure.
+    fn record_failure(&self, db: &str, err: &BackupError) {
+        let BackupError::Other(err) = err else { return };
+        let message = format!("{err:#}").chars().take(FAILURE_MESSAGE_CHARS).collect();
+        self.health.lock().unwrap().entry(db.to_string()).or_default().last_failure = Some(Failure { at_ms: now_ms(), message });
     }
 
     pub fn every(&self) -> Option<Duration> {
@@ -241,18 +360,29 @@ impl Backups {
         self.locks.lock().unwrap().entry(db.to_string()).or_default().clone()
     }
 
-    pub async fn snapshot(&self, registry: &Registry, db: &str) -> Result<BackupInfo, BackupError> {
+    pub async fn snapshot(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
         let lock = self.lock(db);
         let _held = lock.lock().await;
-        self.snapshot_locked(registry, db).await
+        self.snapshot_locked(registry, db, kind).await
     }
 
-    async fn snapshot_locked(&self, registry: &Registry, db: &str) -> Result<BackupInfo, BackupError> {
+    async fn snapshot_locked(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
+        let started = now_ms();
+        let taken = self.take_snapshot(registry, db, kind).await;
+        match &taken {
+            // The snapshot holds every write committed before it started.
+            Ok(_) => self.record_stored(db, started),
+            Err(err) => self.record_failure(db, err),
+        }
+        taken
+    }
+
+    async fn take_snapshot(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
         let config = self.config()?;
         let snapshot = registry.snapshot(db).await?;
         let id = self.next_id().await;
-        let info = BackupInfo { id: id.clone(), size_bytes: snapshot.bytes.len() as u64 };
-        config.target.put(&snapshot_key(db, &id), snapshot.bytes).await?;
+        let info = BackupInfo::new(id.clone(), snapshot.bytes.len() as u64, kind);
+        config.target.put(&snapshot_key(db, &id, kind), snapshot.bytes).await?;
         if config.wal_every.is_some() {
             let cursor = Cursor { generation: id, wal_seq: snapshot.wal.seq, next_frame: snapshot.wal.frame + 1, next_segment: 0 };
             self.cursors.lock().await.insert(db.to_string(), cursor);
@@ -261,10 +391,11 @@ impl Backups {
         Ok(info)
     }
 
-    /// Stop shipping a deleted database's WAL.
+    /// Stop shipping a deleted database's WAL, and forget how its backups went.
     pub async fn forget(&self, db: &str) {
         self.cursors.lock().await.remove(db);
         self.seen.lock().await.remove(db);
+        self.health.lock().unwrap().remove(db);
     }
 
     /// Snapshots of one database, newest first.
@@ -274,27 +405,49 @@ impl Backups {
         }
         let mut out = Vec::new();
         for (name, size_bytes) in self.config()?.target.list(&format!("{db}/")).await? {
-            if let Some(id) = name.strip_suffix(".db").filter(|id| valid_id(id)) {
-                out.push(BackupInfo { id: id.to_string(), size_bytes });
+            if let Some((id, kind)) = Kind::parse(&name) {
+                out.push(BackupInfo::new(id.to_string(), size_bytes, kind));
             }
         }
         out.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(out)
     }
 
-    /// The times a database can be restored to, with WAL shipping on.
-    pub async fn window(&self, db: &str) -> Result<Option<Window>, BackupError> {
+    /// A database's backups, newest first, its point-in-time window, and the
+    /// status of its backups.
+    pub async fn listing(&self, db: &str) -> Result<Listing, BackupError> {
+        let config = self.config()?;
+        let backups = self.list(db).await?;
+        let point_in_time = self.window_of(db, &backups).await?;
+        let last_backup_ms = match &point_in_time {
+            Some(window) => Some(window.latest_ms),
+            None => backups.first().map(|b| b.taken_ms),
+        };
+        let (up_to_date_ms, last_failure) = match self.health.lock().unwrap().get(db) {
+            Some(health) => (health.up_to_date_ms, health.last_failure.clone()),
+            None => (None, None),
+        };
+        let status = Status {
+            every_seconds: config.every.map(|every| every.as_secs()),
+            wal_every_ms: config.wal_every.map(|every| every.as_millis() as u64),
+            keep: config.keep,
+            last_backup_ms,
+            up_to_date_ms,
+            last_failure,
+        };
+        Ok(Listing { backups, point_in_time, status })
+    }
+
+    /// The times a database with these snapshots (newest first) can be
+    /// restored to, with WAL shipping on.
+    async fn window_of(&self, db: &str, snapshots: &[BackupInfo]) -> Result<Option<Window>, BackupError> {
         if self.config()?.wal_every.is_none() {
             return Ok(None);
         }
-        let snapshots = self.list(db).await?;
         let (Some(newest), Some(oldest)) = (snapshots.first(), snapshots.last()) else { return Ok(None) };
         let segments = self.segments(db, &newest.id).await?;
         let shipped = segments.last().map(|s| s.shipped_ms).unwrap_or(0);
-        Ok(Some(Window {
-            earliest_ms: oldest.id.parse().unwrap_or(0),
-            latest_ms: shipped.max(newest.id.parse().unwrap_or(0)),
-        }))
+        Ok(Some(Window { earliest_ms: oldest.taken_ms, latest_ms: shipped.max(newest.taken_ms) }))
     }
 
     /// The bytes of a snapshot; `id` may be `latest`.
@@ -304,12 +457,16 @@ impl Backups {
             return Err(RegistryError::InvalidName.into());
         }
         let target = &self.config()?.target;
-        let id = match id {
-            "latest" => self.list(db).await?.into_iter().next().ok_or(BackupError::NotFound)?.id,
-            id if valid_id(id) => id.to_string(),
-            _ => return Err(BackupError::InvalidId),
-        };
-        target.get(&snapshot_key(db, &id)).await?.ok_or(BackupError::NotFound)
+        if id != "latest" && !valid_id(id) {
+            return Err(BackupError::InvalidId);
+        }
+        let snapshots = self.list(db).await?;
+        let found = match id {
+            "latest" => snapshots.first(),
+            id => snapshots.iter().find(|s| s.id == id),
+        }
+        .ok_or(BackupError::NotFound)?;
+        target.get(&snapshot_key(db, &found.id, found.kind)).await?.ok_or(BackupError::NotFound)
     }
 
     /// The database as it was at `at_ms`: the newest snapshot at or before
@@ -320,10 +477,10 @@ impl Backups {
             .list(db)
             .await?
             .into_iter()
-            .find(|s| s.id.parse::<u64>().is_ok_and(|ms| ms <= at_ms))
+            .find(|s| s.taken_ms <= at_ms)
             .ok_or(BackupError::NotFound)?;
-        let mut bytes = target.get(&snapshot_key(db, &snapshot.id)).await?.ok_or(BackupError::NotFound)?;
-        let mut restored_to_ms = snapshot.id.parse().unwrap_or(0);
+        let mut bytes = target.get(&snapshot_key(db, &snapshot.id, snapshot.kind)).await?.ok_or(BackupError::NotFound)?;
+        let mut restored_to_ms = snapshot.taken_ms;
         for (n, segment) in self.segments(db, &snapshot.id).await?.into_iter().enumerate() {
             // Segments are numbered from 0; stop at a gap or past the time.
             if segment.number != n as u64 || segment.shipped_ms > at_ms {
@@ -359,11 +516,14 @@ impl Backups {
         for name in names {
             // Taken before the snapshot: a write that lands during it changes
             // the fingerprint again, so the next round backs it up.
+            let checked = now_ms();
             let Ok(fingerprint) = registry.fingerprint(&name).await else { continue };
             if self.seen.lock().await.get(&name) == Some(&fingerprint) {
+                // Unchanged since its last scheduled snapshot, which holds it all.
+                self.mark_up_to_date(&name, checked);
                 continue;
             }
-            match self.snapshot(registry, &name).await {
+            match self.snapshot(registry, &name, Kind::Scheduled).await {
                 Ok(_) => {
                     self.seen.lock().await.insert(name, fingerprint);
                 }
@@ -380,6 +540,7 @@ impl Backups {
         };
         for name in names {
             if let Err(err) = self.ship(registry, &name).await {
+                self.record_failure(&name, &err);
                 eprintln!("aozumi-db: WAL shipping for {name} failed: {err:?}");
             }
         }
@@ -399,23 +560,26 @@ impl Backups {
         else {
             // No generation yet (a new database, or a restarted server): a
             // snapshot starts one and covers everything written so far.
-            self.snapshot_locked(registry, db).await?;
+            self.snapshot_locked(registry, db, Kind::Scheduled).await?;
             return Ok(());
         };
 
         let mut next_frame = next_frame;
         let mut next_segment = next_segment;
         let mut wal_frames = 0;
+        // When the last read of the WAL started, and whether a segment went up.
+        let (mut read_at, mut uploaded) = (now_ms(), false);
         // Ship until nothing new is left (bounded), so the checkpoint below
         // races with as little as possible.
         for _ in 0..3 {
+            read_at = now_ms();
             let (position, frames) = {
                 let open = open.clone();
                 tokio::task::spawn_blocking(move || read_new_frames(&open, next_frame)).await??
             };
             if position.seq != wal_seq {
                 // The WAL restarted under us; its unshipped frames are gone.
-                self.snapshot_locked(registry, db).await?;
+                self.snapshot_locked(registry, db, Kind::Scheduled).await?;
                 return Ok(());
             }
             wal_frames = position.frame;
@@ -425,6 +589,7 @@ impl Backups {
                 Ok(()) => {
                     next_frame = last + 1;
                     next_segment += 1;
+                    uploaded = true;
                     if let Some(cursor) = self.cursors.lock().await.get_mut(db) {
                         cursor.next_frame = next_frame;
                         cursor.next_segment = next_segment;
@@ -434,6 +599,7 @@ impl Backups {
                     // Keep the WAL from growing without end while the store
                     // is down; the generation is broken either way.
                     eprintln!("aozumi-db: WAL shipping for {db} failed, checkpointing anyway: {err:?}");
+                    self.record_failure(db, &BackupError::Other(err));
                     self.cursors.lock().await.remove(db);
                     tokio::task::spawn_blocking(move || checkpoint(&open, u64::MAX)).await??;
                     return Ok(());
@@ -446,6 +612,13 @@ impl Backups {
         }
 
         let shipped_to = next_frame - 1;
+        // Every frame committed when the WAL was last read is in the store.
+        if shipped_to >= wal_frames {
+            match uploaded {
+                true => self.record_stored(db, read_at),
+                false => self.mark_up_to_date(db, read_at),
+            }
+        }
         if wal_frames < CHECKPOINT_FRAMES || shipped_to < wal_frames {
             return Ok(());
         }
@@ -465,7 +638,7 @@ impl Backups {
             // A commit landed in the instant before the checkpoint, which
             // folded it in unshipped: start a new generation.
             Checkpoint::Done { backfilled } if backfilled > shipped_to => {
-                self.snapshot_locked(registry, db).await?;
+                self.snapshot_locked(registry, db, Kind::Scheduled).await?;
             }
             Checkpoint::Done { .. } => {
                 let position = tokio::task::spawn_blocking(move || wal_position(&open)).await??;
@@ -484,7 +657,7 @@ impl Backups {
             for segment in self.segments(db, &old.id).await? {
                 config.target.delete(&format!("{}{}", wal_dir(db, &old.id), segment.name)).await?;
             }
-            config.target.delete(&snapshot_key(db, &old.id)).await?;
+            config.target.delete(&snapshot_key(db, &old.id, old.kind)).await?;
         }
         Ok(())
     }
@@ -626,6 +799,19 @@ fn parse_rfc3339(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_names_carry_their_kind() {
+        assert_eq!(Kind::parse("0001761000000000.db"), Some(("0001761000000000", Kind::Scheduled)));
+        assert_eq!(Kind::parse("1761000000000.manual.db"), Some(("1761000000000", Kind::Manual)));
+        assert_eq!(Kind::parse("1761000000000.before-restore.db"), Some(("1761000000000", Kind::BeforeRestore)));
+        assert_eq!(Kind::parse("1761000000000.other.db"), None, "an unknown kind is not a snapshot here");
+        assert_eq!(Kind::parse(".123.partial"), None);
+        for kind in [Kind::Scheduled, Kind::Manual, Kind::BeforeRestore] {
+            let key = snapshot_key("app", "1761000000000", kind);
+            assert_eq!(Kind::parse(key.strip_prefix("app/").unwrap()), Some(("1761000000000", kind)));
+        }
+    }
 
     #[test]
     fn rfc3339_times_parse_to_unix_milliseconds() {
