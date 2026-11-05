@@ -278,6 +278,22 @@ async fn backups_asked_for_never_push_out_the_point_in_time_history() {
 }
 
 #[tokio::test]
+async fn spacing_outlasts_the_backup_it_counts_from() {
+    let (_dir, cfg) = store(10, None, None);
+    let server = TestServer::with_backups(&cfg).await;
+    server.database("app").await;
+    let (status, body) = policy(&server, "app", json!({"retention_hours": 1, "manual_every_seconds": 7200})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, first) = snapshot(&server, "app").await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    // Pruned, as a retention window shorter than the spacing prunes it.
+    std::fs::remove_file(file_of(&cfg.dir, "app", first["id"].as_str().unwrap())).unwrap();
+    let (status, body) = snapshot(&server, "app").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the spacing still counts from the pruned backup: {body}");
+}
+
+#[tokio::test]
 async fn a_server_wide_default_retention_covers_databases_without_their_own() {
     let dir = tempfile::tempdir().unwrap();
     let backup = aozumi_db::BackupConfig {

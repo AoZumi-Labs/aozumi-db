@@ -227,7 +227,8 @@ curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Beare
   on the schedule even while the database is unchanged, and the newest one is
   never deleted. Without it, backups are kept by count.
 - `manual_every_seconds` refuses a manual backup that comes sooner than that
-  after the last one: `429` with `retry-after`.
+  after the last one: `429` with `retry-after`. The last one counts even once
+  pruning has deleted it, until the server restarts.
 - `manual_keep` keeps at most that many of the backups asked for (manual ones,
   and those a restore in place takes), newest first.
 

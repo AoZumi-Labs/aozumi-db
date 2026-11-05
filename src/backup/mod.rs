@@ -317,6 +317,10 @@ pub struct Backups {
     /// Snapshots and WAL shipping of one database never overlap.
     locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     health: std::sync::Mutex<HashMap<String, Health>>,
+    /// When each database's last manual backup was taken, since this server
+    /// started: its policy's spacing counts from it even once pruning has
+    /// deleted the backup.
+    last_manual: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl Backups {
@@ -328,6 +332,7 @@ impl Backups {
             cursors: Mutex::new(HashMap::new()),
             locks: std::sync::Mutex::new(HashMap::new()),
             health: std::sync::Mutex::new(HashMap::new()),
+            last_manual: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -374,16 +379,23 @@ impl Backups {
         if kind == Kind::Manual {
             self.check_spacing(registry, db).await?;
         }
-        self.snapshot_locked(registry, db, kind).await
+        let taken = self.snapshot_locked(registry, db, kind).await;
+        if let (Kind::Manual, Ok(info)) = (kind, &taken) {
+            self.last_manual.lock().unwrap().insert(db.to_string(), info.taken_ms);
+        }
+        taken
     }
 
     /// Refuses a manual backup that comes sooner after the last one than the
-    /// database's policy allows.
+    /// database's policy allows. The last one is the newest the store holds,
+    /// or the last this server took, whichever is later: a retention window
+    /// shorter than the spacing can prune it first.
     async fn check_spacing(&self, registry: &Registry, db: &str) -> Result<(), BackupError> {
         let Some(every) = registry.open(db, false).await?.backup_policy.manual_every_seconds else { return Ok(()) };
         let every_ms = every.saturating_mul(1000);
-        let last = self.list(db).await?.into_iter().find(|b| b.kind == Kind::Manual).map(|b| b.taken_ms);
-        match last.map(|taken| now_ms().saturating_sub(taken)) {
+        let stored = self.list(db).await?.into_iter().find(|b| b.kind == Kind::Manual).map(|b| b.taken_ms);
+        let remembered = self.last_manual.lock().unwrap().get(db).copied();
+        match stored.max(remembered).map(|taken| now_ms().saturating_sub(taken)) {
             Some(since) if since < every_ms => Err(BackupError::TooSoon { retry_after: Duration::from_millis(every_ms - since) }),
             _ => Ok(()),
         }
@@ -422,6 +434,7 @@ impl Backups {
         self.cursors.lock().await.remove(db);
         self.seen.lock().await.remove(db);
         self.health.lock().unwrap().remove(db);
+        self.last_manual.lock().unwrap().remove(db);
     }
 
     /// Snapshots of one database, newest first.
