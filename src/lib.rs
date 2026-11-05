@@ -170,20 +170,35 @@ pub async fn serve(listener: TcpListener, mut config: Config) -> anyhow::Result<
     }
 }
 
-/// Serve one connection's requests, plain or TLS. With `header_timeout`, a
-/// request's headers must arrive within it, and so must the next request on
-/// a kept-alive connection.
-async fn serve_connection<I>(io: I, state: Arc<State>, header_timeout: Option<Duration>)
+/// How long a client may take to send what it sends, on a listener whose
+/// clients the server cannot vouch for.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// For a request's headers, and between requests on a kept-alive connection.
+    header: Duration,
+    /// For a request's body, once its headers are in.
+    body: Duration,
+}
+
+/// The time a request's body has to arrive, carried on the request.
+#[derive(Clone, Copy)]
+struct BodyTimeout(Duration);
+
+/// Serve one connection's requests, plain or TLS, within `timeouts` if given.
+async fn serve_connection<I>(io: I, state: Arc<State>, timeouts: Option<Timeouts>)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| {
+    let service = service_fn(move |mut req: Request<Incoming>| {
         let state = state.clone();
+        if let Some(timeouts) = timeouts {
+            req.extensions_mut().insert(BodyTimeout(timeouts.body));
+        }
         async move { Ok::<_, Infallible>(handle(state, req).await) }
     });
     let mut builder = http1::Builder::new();
-    if let Some(timeout) = header_timeout {
-        builder.timer(TokioTimer::new()).header_read_timeout(timeout);
+    if let Some(timeouts) = timeouts {
+        builder.timer(TokioTimer::new()).header_read_timeout(timeouts.header);
     }
     // A client that hangs up mid-request is not a server error.
     let _ = builder.serve_connection(io, service).await;
@@ -885,11 +900,17 @@ fn unix_now() -> u64 {
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, Resp> {
-    let body = Limited::new(req.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?
-        .to_bytes();
+    let timeout = req.extensions().get::<BodyTimeout>().copied();
+    let collect = Limited::new(req.into_body(), MAX_BODY_BYTES).collect();
+    let collected = match timeout {
+        // A body that trickles in would hold its connection, and the
+        // connection's place, for as long as the client liked.
+        Some(BodyTimeout(timeout)) => tokio::time::timeout(timeout, collect)
+            .await
+            .map_err(|_| text(StatusCode::REQUEST_TIMEOUT, "the request body did not arrive in time"))?,
+        None => collect.await,
+    };
+    let body = collected.map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?.to_bytes();
     serde_json::from_slice(&body).map_err(|err| text(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {err}")))
 }
 

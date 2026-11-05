@@ -17,7 +17,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde_json::json;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A self-signed certificate for `localhost` and its key, as PEM.
@@ -65,9 +65,8 @@ async fn server(tls: impl FnOnce(TcpListener) -> Tls) -> (TestServer, SocketAddr
     (server, addr)
 }
 
-/// One HTTPS request on a fresh connection that trusts `roots`. Answers the
-/// status, the body and the certificate the server presented.
-async fn get(addr: SocketAddr, roots: &[&Pair], method: Method, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<(StatusCode, String, CertificateDer<'static>)> {
+/// A TLS connection to `addr` that trusts `roots`.
+async fn connect(addr: SocketAddr, roots: &[&Pair]) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut store = rustls::RootCertStore::empty();
     for root in roots {
         store.add(root.der.clone())?;
@@ -77,7 +76,13 @@ async fn get(addr: SocketAddr, roots: &[&Pair], method: Method, path: &str, body
         .with_root_certificates(store)
         .with_no_client_auth();
     let tcp = TcpStream::connect(addr).await?;
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(ServerName::try_from("localhost")?, tcp).await?;
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(ServerName::try_from("localhost")?, tcp).await?)
+}
+
+/// One HTTPS request on a fresh connection that trusts `roots`. Answers the
+/// status, the body and the certificate the server presented.
+async fn get(addr: SocketAddr, roots: &[&Pair], method: Method, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<(StatusCode, String, CertificateDer<'static>)> {
+    let tls = connect(addr, roots).await?;
     let presented = tls.get_ref().1.peer_certificates().unwrap()[0].clone().into_owned();
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
     tokio::spawn(conn);
@@ -225,6 +230,29 @@ async fn closes_connections_that_never_finish_the_handshake() {
 
     let mut silent = TcpStream::connect(addr).await.unwrap();
     assert!(closed_by_server(&mut silent, Duration::from_secs(3)).await);
+}
+
+#[tokio::test]
+async fn closes_requests_whose_body_never_arrives() {
+    let (files, a) = (files(), pair());
+    install(&files, &a);
+    let (cert, key) = (files.cert.clone(), files.key.clone());
+    let (_server, addr) =
+        server(|l| Tls { body_timeout: Duration::from_millis(300), max_connections_per_address: 1, ..Tls::new(l, cert, key) }).await;
+
+    // The headers in full, then a little of the body, then nothing.
+    let mut stalled = connect(addr, &[&a]).await.unwrap();
+    stalled.write_all(b"POST /v2/pipeline HTTP/1.1\r\nhost: localhost\r\ncontent-length: 100\r\n\r\n{\"baton\": ").await.unwrap();
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), stalled.read_to_end(&mut answer)).await;
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(read.is_ok(), "the server closes the connection");
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+
+    // Its place is free again.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _, _) = get(addr, &[&a], Method::GET, "/health", None).await.unwrap();
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

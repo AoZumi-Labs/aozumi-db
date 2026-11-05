@@ -43,6 +43,9 @@ pub struct Tls {
     pub max_connections_per_address: usize,
     /// How long a client has to finish the TLS handshake. 10 s by default.
     pub handshake_timeout: Duration,
+    /// How long a request's body may take to arrive once its headers have.
+    /// 30 s by default.
+    pub body_timeout: Duration,
 }
 
 impl Tls {
@@ -54,6 +57,7 @@ impl Tls {
             max_connections: 2_048,
             max_connections_per_address: 256,
             handshake_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -85,11 +89,12 @@ pub(crate) async fn serve(tls: Tls, state: Arc<crate::State>) {
         let Some(place) = Places::claim(&places, peer.ip()) else { continue };
         certificates.refresh();
         let (acceptor, state, timeout) = (acceptor.clone(), state.clone(), tls.handshake_timeout);
+        let timeouts = crate::Timeouts { header: HEADER_READ_TIMEOUT, body: tls.body_timeout };
         tokio::spawn(async move {
             let _place = place;
             let _ = stream.set_nodelay(true);
             let Ok(Ok(stream)) = tokio::time::timeout(timeout, acceptor.accept(stream)).await else { return };
-            crate::serve_connection(TokioIo::new(stream), state, Some(HEADER_READ_TIMEOUT)).await;
+            crate::serve_connection(TokioIo::new(stream), state, Some(timeouts)).await;
         });
     }
 }

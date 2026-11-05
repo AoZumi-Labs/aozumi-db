@@ -102,8 +102,9 @@ The server can start before its first certificate exists: handshakes fail
 until the files hold a matching pair, while the plain listener answers the
 challenge that gets it. Every client of this listener counts against
 `AOZUMI_DB_TLS_MAX_CONNECTIONS` and its address's share, a handshake must
-finish within 10 s, and a request's headers, or the next request on a
-kept-alive connection, must arrive within 30 s.
+finish within 10 s, a request's headers, or the next request on a
+kept-alive connection, must arrive within 30 s, and so must its body once
+the headers are in (`408` otherwise).
 
 ## Read-only tokens
 
