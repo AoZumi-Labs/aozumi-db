@@ -55,18 +55,6 @@ async fn listing(server: &TestServer, db: &str) -> Value {
     body
 }
 
-/// Polls the listing until `done` holds, for at most 5 s.
-async fn listing_until(server: &TestServer, db: &str, done: impl Fn(&Value) -> bool) -> Value {
-    for _ in 0..250 {
-        let body = listing(server, db).await;
-        if done(&body) {
-            return body;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("never true: {}", listing(server, db).await);
-}
-
 #[tokio::test]
 async fn each_backup_says_when_it_was_taken_and_why() {
     let (_dir, cfg) = backups(10, Some(Duration::from_millis(100)));
@@ -76,8 +64,7 @@ async fn each_backup_says_when_it_was_taken_and_why() {
     // The server's own schedule backs it up first. A tick may land between
     // creating the database and its table, so let the schedule settle: no
     // backups while the database is unchanged.
-    listing_until(&server, "app", |b| !b["backups"].as_array().unwrap().is_empty()).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.settle_backups("app").await;
     let settled = list(&server, "app").await;
 
     let before = now_ms();
@@ -134,7 +121,7 @@ async fn with_wal_shipping_the_status_follows_every_write() {
     for i in 0..3 {
         server.run(Some(&app), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
         let written = now_ms();
-        let body = listing_until(&server, "app", |b| b["status"]["up_to_date_ms"].as_u64().is_some_and(|ms| ms >= written)).await;
+        let body = server.backups_until("app", |b| b["status"]["up_to_date_ms"].as_u64().is_some_and(|ms| ms >= written)).await;
         let status = &body["status"];
         assert_eq!(status["every_seconds"], 3600, "{status}");
         assert_eq!(status["wal_every_ms"], 50, "{status}");
@@ -332,18 +319,28 @@ async fn scheduled_backups_skip_unchanged_databases_and_keep_the_newest() {
 
     // A tick may land between creating the database and its table, so
     // there may be one or two backups; after that, nothing while unchanged.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.settle_backups("app").await;
     let settled = list(&server, "app").await;
     assert!(!settled.is_empty());
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Three ticks find it unchanged; each moves its up-to-date time on.
+    let mut checked = now_ms();
+    for _ in 0..3 {
+        checked = server.backed_up_past("app", checked).await;
+    }
     assert_eq!(list(&server, "app").await, settled, "no backups while the database is unchanged");
 
+    // Each change is backed up: by the next tick, or by two when a tick that
+    // looked just before the write also caught it.
+    let mut newest = Vec::new();
     for i in 0..3 {
         server.run(Some(&app), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        server.settle_backups("app").await;
+        newest.push(list(&server, "app").await[0].clone());
     }
     let kept = list(&server, "app").await;
     assert_eq!(kept.len(), 2, "only the newest two are kept: {kept:?}");
+    assert_eq!(kept[0], newest[2], "the newest is the last change's");
+    assert!(!kept.contains(&newest[0]), "older ones go: {kept:?}");
 
     let (status, _) = restore(&server, "copy", "app", "latest").await;
     assert_eq!(status, StatusCode::CREATED);
