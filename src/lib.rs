@@ -136,6 +136,17 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
                 state.backups.run_scheduled(&state.registry).await;
             }
         });
+    } else if let Some(every) = state.backups.prune_every() {
+        // No schedule prunes as it goes, so backups age out on a timer.
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.prune_all(&state.registry).await;
+            }
+        });
     }
     loop {
         let (stream, _) = listener.accept().await?;
@@ -612,7 +623,7 @@ async fn list_backups(state: &State, name: &str) -> Resp {
 /// Restore a database in place: `{"backup": id | "latest"}` or `{"at": time}`
 /// → `{"name", "restored_to_ms", "before_restore": backup}` (D26). The
 /// database keeps its name, tokens, limits and backup policy.
-async fn restore_in_place(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+async fn restore_in_place(state: &Arc<State>, name: &str, req: Request<Incoming>) -> Resp {
     #[derive(Deserialize)]
     struct Body {
         backup: Option<String>,
@@ -638,9 +649,17 @@ async fn restore_in_place(state: &State, name: &str, req: Request<Incoming>) -> 
         Ok(fetched) => fetched,
         Err(err) => return backup_error(err),
     };
-    match replace_with_backup(state, name, bytes).await {
-        Ok(before) => json(StatusCode::OK, &json!({"name": name, "restored_to_ms": restored_to_ms, "before_restore": before})),
-        Err(err) => backup_error(err),
+    // From here the restore runs as a task of its own, to its end: a request
+    // dropped halfway, by a client that hung up, would leave the database
+    // closing, with every write refused, and its scratch files behind.
+    let replacing = {
+        let (state, name) = (state.clone(), name.to_string());
+        tokio::spawn(async move { replace_with_backup(&state, &name, bytes).await })
+    };
+    match replacing.await {
+        Ok(Ok(before)) => json(StatusCode::OK, &json!({"name": name, "restored_to_ms": restored_to_ms, "before_restore": before})),
+        Ok(Err(err)) => backup_error(err),
+        Err(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("the restore stopped: {err}")),
     }
 }
 
@@ -683,7 +702,7 @@ async fn replace_with_backup(state: &State, name: &str, bytes: Vec<u8>) -> Resul
             return Err(err);
         }
     };
-    let replaced = state.registry.replace(name, staged).await;
+    let replaced = state.registry.replace(name, &old, staged).await;
     let _ = tokio::task::spawn_blocking(move || held.release()).await;
     drop(turn);
     state.streams.close_database(name).await;
@@ -824,6 +843,7 @@ fn registry_error(err: RegistryError) -> Resp {
         RegistryError::InvalidLimits(message) => text(StatusCode::BAD_REQUEST, &message),
         RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
         RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
+        RegistryError::Changed => text(StatusCode::CONFLICT, "the database was deleted or made again meanwhile; nothing was replaced"),
         RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),
     }
 }
