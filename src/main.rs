@@ -143,6 +143,8 @@ fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
         keep: keep.max(1) as usize,
         every: (every > 0).then(|| Duration::from_secs(every)),
         wal_every: (wal_ms > 0).then(|| Duration::from_millis(wal_ms)),
+        // Without a schedule, as often as the default schedule would run.
+        prune_every: Duration::from_secs(300),
     }))
 }
 

@@ -149,6 +149,17 @@ pub async fn serve(listener: TcpListener, mut config: Config) -> anyhow::Result<
                 state.backups.run_scheduled(&state.registry).await;
             }
         });
+    } else if let Some(every) = state.backups.prune_every() {
+        // No schedule prunes as it goes, so backups age out on a timer.
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.prune_all(&state.registry).await;
+            }
+        });
     }
     if let Some(tls) = tls {
         tokio::spawn(tls::serve(tls, state.clone()));
@@ -159,20 +170,35 @@ pub async fn serve(listener: TcpListener, mut config: Config) -> anyhow::Result<
     }
 }
 
-/// Serve one connection's requests, plain or TLS. With `header_timeout`, a
-/// request's headers must arrive within it, and so must the next request on
-/// a kept-alive connection.
-async fn serve_connection<I>(io: I, state: Arc<State>, header_timeout: Option<Duration>)
+/// How long a client may take to send what it sends, on a listener whose
+/// clients the server cannot vouch for.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// For a request's headers, and between requests on a kept-alive connection.
+    header: Duration,
+    /// For a request's body, once its headers are in.
+    body: Duration,
+}
+
+/// The time a request's body has to arrive, carried on the request.
+#[derive(Clone, Copy)]
+struct BodyTimeout(Duration);
+
+/// Serve one connection's requests, plain or TLS, within `timeouts` if given.
+async fn serve_connection<I>(io: I, state: Arc<State>, timeouts: Option<Timeouts>)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| {
+    let service = service_fn(move |mut req: Request<Incoming>| {
         let state = state.clone();
+        if let Some(timeouts) = timeouts {
+            req.extensions_mut().insert(BodyTimeout(timeouts.body));
+        }
         async move { Ok::<_, Infallible>(handle(state, req).await) }
     });
     let mut builder = http1::Builder::new();
-    if let Some(timeout) = header_timeout {
-        builder.timer(TokioTimer::new()).header_read_timeout(timeout);
+    if let Some(timeouts) = timeouts {
+        builder.timer(TokioTimer::new()).header_read_timeout(timeouts.header);
     }
     // A client that hangs up mid-request is not a server error.
     let _ = builder.serve_connection(io, service).await;
@@ -659,7 +685,7 @@ async fn list_backups(state: &State, name: &str) -> Resp {
 /// Restore a database in place: `{"backup": id | "latest"}` or `{"at": time}`
 /// → `{"name", "restored_to_ms", "before_restore": backup}` (D26). The
 /// database keeps its name, tokens, limits and backup policy.
-async fn restore_in_place(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+async fn restore_in_place(state: &Arc<State>, name: &str, req: Request<Incoming>) -> Resp {
     #[derive(Deserialize)]
     struct Body {
         backup: Option<String>,
@@ -685,9 +711,17 @@ async fn restore_in_place(state: &State, name: &str, req: Request<Incoming>) -> 
         Ok(fetched) => fetched,
         Err(err) => return backup_error(err),
     };
-    match replace_with_backup(state, name, bytes).await {
-        Ok(before) => json(StatusCode::OK, &json!({"name": name, "restored_to_ms": restored_to_ms, "before_restore": before})),
-        Err(err) => backup_error(err),
+    // From here the restore runs as a task of its own, to its end: a request
+    // dropped halfway, by a client that hung up, would leave the database
+    // closing, with every write refused, and its scratch files behind.
+    let replacing = {
+        let (state, name) = (state.clone(), name.to_string());
+        tokio::spawn(async move { replace_with_backup(&state, &name, bytes).await })
+    };
+    match replacing.await {
+        Ok(Ok(before)) => json(StatusCode::OK, &json!({"name": name, "restored_to_ms": restored_to_ms, "before_restore": before})),
+        Ok(Err(err)) => backup_error(err),
+        Err(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("the restore stopped: {err}")),
     }
 }
 
@@ -730,7 +764,7 @@ async fn replace_with_backup(state: &State, name: &str, bytes: Vec<u8>) -> Resul
             return Err(err);
         }
     };
-    let replaced = state.registry.replace(name, staged).await;
+    let replaced = state.registry.replace(name, &old, staged).await;
     let _ = tokio::task::spawn_blocking(move || held.release()).await;
     drop(turn);
     state.streams.close_database(name).await;
@@ -776,20 +810,29 @@ async fn delete_database(state: &Arc<State>, name: &str, query: Option<&str>) ->
         Some("backups=delete") => true,
         Some(_) => return text(StatusCode::BAD_REQUEST, "a delete takes `?backups=delete` or `?backups=keep`"),
     };
+    // Held across the delete, so no snapshot or WAL shipping of the database
+    // runs meanwhile, and a database made again under the name starts its
+    // backups only after this one's were listed.
+    let lock = state.backups.lock(name);
+    let _backing_up = lock.lock().await;
+    // Listed before anything is deleted: when the store cannot be listed,
+    // the delete fails and changes nothing.
+    let keys = match with_backups {
+        false => None,
+        true => match state.backups.backup_keys(name).await {
+            Ok(keys) => Some(keys),
+            Err(BackupError::NotConfigured) => None,
+            Err(err) => return backup_error(err),
+        },
+    };
     match state.registry.delete(name).await {
         Ok(()) => {
             state.streams.close_database(name).await;
             state.rates.forget(name);
             state.backups.forget(name).await;
-            if with_backups {
-                match state.backups.backup_keys(name).await {
-                    Ok(keys) => {
-                        let (state, name) = (state.clone(), name.to_string());
-                        tokio::spawn(async move { state.backups.delete_keys(&name, keys).await });
-                    }
-                    Err(BackupError::NotConfigured) => {}
-                    Err(err) => return backup_error(err),
-                }
+            if let Some(keys) = keys {
+                let (state, name) = (state.clone(), name.to_string());
+                tokio::spawn(async move { state.backups.delete_keys(&name, keys).await });
             }
             Response::builder().status(StatusCode::NO_CONTENT).body(full(Bytes::new())).unwrap()
         }
@@ -857,11 +900,17 @@ fn unix_now() -> u64 {
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, Resp> {
-    let body = Limited::new(req.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?
-        .to_bytes();
+    let timeout = req.extensions().get::<BodyTimeout>().copied();
+    let collect = Limited::new(req.into_body(), MAX_BODY_BYTES).collect();
+    let collected = match timeout {
+        // A body that trickles in would hold its connection, and the
+        // connection's place, for as long as the client liked.
+        Some(BodyTimeout(timeout)) => tokio::time::timeout(timeout, collect)
+            .await
+            .map_err(|_| text(StatusCode::REQUEST_TIMEOUT, "the request body did not arrive in time"))?,
+        None => collect.await,
+    };
+    let body = collected.map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?.to_bytes();
     serde_json::from_slice(&body).map_err(|err| text(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {err}")))
 }
 
@@ -871,6 +920,7 @@ fn registry_error(err: RegistryError) -> Resp {
         RegistryError::InvalidLimits(message) => text(StatusCode::BAD_REQUEST, &message),
         RegistryError::Exists => text(StatusCode::CONFLICT, "database already exists"),
         RegistryError::NotFound => text(StatusCode::NOT_FOUND, "database not found"),
+        RegistryError::Changed => text(StatusCode::CONFLICT, "the database was deleted or made again meanwhile; nothing was replaced"),
         RegistryError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {err}")),
     }
 }

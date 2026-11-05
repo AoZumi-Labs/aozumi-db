@@ -228,6 +228,104 @@ async fn backups_asked_for_do_not_split_the_point_in_time_history() {
 }
 
 #[tokio::test]
+async fn backups_asked_for_never_push_out_the_point_in_time_history() {
+    // Kept by count, 2 a database, with WAL shipping on.
+    let (_dir, cfg) = store(2, None, Some(Duration::from_millis(50)));
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    let mut generation = None;
+    for _ in 0..250 {
+        generation = kept(&server, "app").await.into_iter().find(|(_, kind)| kind == "scheduled").map(|(id, _)| id);
+        if generation.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let generation = generation.expect("WAL shipping starts a generation");
+
+    let mut asked = Vec::new();
+    for _ in 0..3 {
+        let (status, body) = snapshot(&server, "app").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        asked.push(body["id"].as_str().unwrap().to_string());
+    }
+    let left = kept(&server, "app").await;
+    assert!(left.contains(&(generation.clone(), "scheduled".to_string())), "the generation WAL ships into stays: {left:?}");
+    let asked_left = left.iter().filter(|(_, kind)| kind == "manual").map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+    assert_eq!(asked_left, [asked[2].as_str(), asked[1].as_str()], "the newest 2 asked for: {left:?}");
+
+    // Every moment since the generation started still restores.
+    server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
+    let written = now_ms();
+    let mut latest = 0;
+    for _ in 0..250 {
+        latest = listing(&server, "app").await["point_in_time"]["latest_ms"].as_u64().unwrap_or(0);
+        if latest >= written {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(latest >= written, "the point-in-time window reaches the last write");
+    let (status, body) = server
+        .admin(Method::POST, "/v1/databases", Some(json!({"name": "at", "restore": {"database": "app", "at": latest}})))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = server.token("at").await;
+    assert_eq!(scalar(&server.run(Some(&token), vec![execute("SELECT count(*) FROM t")]).await), "2");
+}
+
+#[tokio::test]
+async fn backups_age_out_without_a_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let backup = aozumi_db::BackupConfig {
+        target: aozumi_db::BackupTarget::directory(store.clone()),
+        keep: 10,
+        every: None,
+        wal_every: None,
+        prune_every: Duration::from_millis(100),
+    };
+    let server = TestServer::with_backup(backup).await;
+    server.database("app").await;
+    assert_eq!(policy(&server, "app", json!({"retention_hours": 1})).await.0, StatusCode::OK);
+    let (_, asked) = snapshot(&server, "app").await;
+    let asked = asked["id"].as_str().unwrap().to_string();
+    let real = file_of(&store, "app", &asked);
+    let old = plant(&store, "app", &real, 5 * HOUR_MS);
+    let older = plant(&store, "app", &real, 6 * HOUR_MS);
+
+    // No backup is taken from here on.
+    let mut left = kept(&server, "app").await;
+    for _ in 0..250 {
+        if !ids(&left).contains(&older.as_str()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        left = kept(&server, "app").await;
+    }
+    assert!(!ids(&left).contains(&older.as_str()), "aged out with no schedule: {left:?}");
+    assert!(ids(&left).contains(&old.as_str()), "the newest from before the window stays: {left:?}");
+    assert!(ids(&left).contains(&asked.as_str()), "{left:?}");
+}
+
+#[tokio::test]
+async fn spacing_outlasts_the_backup_it_counts_from() {
+    let (_dir, cfg) = store(10, None, None);
+    let server = TestServer::with_backups(&cfg).await;
+    server.database("app").await;
+    let (status, body) = policy(&server, "app", json!({"retention_hours": 1, "manual_every_seconds": 7200})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, first) = snapshot(&server, "app").await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    // Pruned, as a retention window shorter than the spacing prunes it.
+    std::fs::remove_file(file_of(&cfg.dir, "app", first["id"].as_str().unwrap())).unwrap();
+    let (status, body) = snapshot(&server, "app").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the spacing still counts from the pruned backup: {body}");
+}
+
+#[tokio::test]
 async fn a_server_wide_default_retention_covers_databases_without_their_own() {
     let dir = tempfile::tempdir().unwrap();
     let backup = aozumi_db::BackupConfig {
@@ -235,6 +333,7 @@ async fn a_server_wide_default_retention_covers_databases_without_their_own() {
         keep: 1,
         every: None,
         wal_every: None,
+        prune_every: PRUNE_EVERY,
     };
     let server = TestServer::with_secret_and(move |c| {
         c.backup = Some(backup);

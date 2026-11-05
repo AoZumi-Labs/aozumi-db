@@ -63,7 +63,7 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `AOZUMI_DB_DEV` | unset | `1` runs without a secret: no auth, one database named `default` |
 | `AOZUMI_DB_BACKUP_URL` | unset (no backups) | `s3://bucket/prefix` or `file:///path` |
 | `AOZUMI_DB_BACKUP_EVERY` | `300` | Seconds between backups of changed databases; `0` = only on request |
-| `AOZUMI_DB_BACKUP_KEEP` | `24` | Backups kept per database |
+| `AOZUMI_DB_BACKUP_KEEP` | `24` | Scheduled backups kept per database without a retention window, and apart from them as many asked for |
 | `AOZUMI_DB_BACKUP_WAL_MS` | `1000` | Ship the WAL this often for point-in-time restore; `0` = off |
 | `AOZUMI_DB_BACKUP_RETENTION_HOURS` | unset | Keep the backups of databases without a policy of their own for this many hours, instead of by count |
 | `AOZUMI_DB_S3_ENDPOINT` | AWS S3 | An S3-compatible endpoint, e.g. Cloudflare R2 or MinIO |
@@ -102,8 +102,9 @@ The server can start before its first certificate exists: handshakes fail
 until the files hold a matching pair, while the plain listener answers the
 challenge that gets it. Every client of this listener counts against
 `AOZUMI_DB_TLS_MAX_CONNECTIONS` and its address's share, a handshake must
-finish within 10 s, and a request's headers, or the next request on a
-kept-alive connection, must arrive within 30 s.
+finish within 10 s, a request's headers, or the next request on a
+kept-alive connection, must arrive within 30 s, and so must its body once
+the headers are in (`408` otherwise).
 
 ## Read-only tokens
 
@@ -204,9 +205,10 @@ curl -X DELETE "localhost:8080/v1/databases/notes?backups=delete" -H "authorizat
 ```
 
 Two downloads are sent at a time; each holds its backup in memory until it
-is sent. Deleting with `?backups=delete` lists the backups there at that
-moment and deletes them in the background, so a database created again under
-the name keeps its own.
+is sent. Deleting with `?backups=delete` lists the backups there before it
+deletes the database, and deletes them in the background; the name is free
+again only after the listing, so a database created again under it keeps its
+own. A store that cannot be listed fails the delete, and nothing is deleted.
 
 ### Restoring in place
 
@@ -223,6 +225,9 @@ with the restored data. It first stores what it replaces as a
 cannot store it, nothing changes. Writes wait while it runs (seconds for a
 large database), reads go on, and a write that waited lands in the restored
 database. Its open transactions end: their streams close, rolling back.
+Once started, a restore runs to its end even if the client hangs up. A
+database deleted while it ran, and perhaps made again under the name, is left
+as it is: the restore answers `409` and replaces nothing.
 
 Deleting a database and restoring a backup under its old name works too.
 Deleting closes the database's open streams, rolling back their transactions,
@@ -274,8 +279,9 @@ curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI
 
 ### A database's backup policy
 
-By default a database keeps the newest `AOZUMI_DB_BACKUP_KEEP` backups, and
-backups can be asked for at any time. A database's own policy changes that:
+By default a database keeps its newest `AOZUMI_DB_BACKUP_KEEP` scheduled backups,
+and apart from them as many of the backups asked for, which can be asked for at
+any time. A database's own policy changes that:
 
 ```bash
 curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET" \
@@ -286,10 +292,12 @@ curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Beare
 - `retention_hours` keeps every backup taken in that many hours, plus the
   newest scheduled one from before, where the window's history starts, so a
   database can always be restored to any moment in the window. Backups age out
-  on the schedule even while the database is unchanged, and the newest one is
-  never deleted. Without it, backups are kept by count.
+  on the schedule even while the database is unchanged (every 5 minutes on a
+  server without a schedule), and the newest one is never deleted. Without it,
+  backups are kept by count.
 - `manual_every_seconds` refuses a manual backup that comes sooner than that
-  after the last one: `429` with `retry-after`.
+  after the last one: `429` with `retry-after`. The last one counts even once
+  pruning has deleted it, until the server restarts.
 - `manual_keep` keeps at most that many of the backups asked for (manual ones,
   and those a restore in place takes), newest first.
 

@@ -169,6 +169,9 @@ pub enum RegistryError {
     InvalidLimits(String),
     Exists,
     NotFound,
+    /// The database was deleted, and maybe made again under its name, while
+    /// a change to it was under way.
+    Changed,
     Other(anyhow::Error),
 }
 
@@ -323,13 +326,21 @@ impl Registry {
     /// Replace a database's file with a staged copy, keeping its limits,
     /// backup policy and token generation. Its WAL goes first, so it is
     /// never replayed onto the copy. The old file closes: connections still
-    /// on it keep it until they end, and nothing new opens on it.
-    pub async fn replace(&self, name: &str, staged: Staged) -> Result<(), RegistryError> {
+    /// on it keep it until they end, and nothing new opens on it. `expected`
+    /// is the database the copy is for: one deleted meanwhile, and maybe made
+    /// again under the name, is left as it is.
+    pub async fn replace(&self, name: &str, expected: &OpenDb, staged: Staged) -> Result<(), RegistryError> {
         let mut open = self.open.lock().await;
-        let Some(old) = open.remove(name) else {
-            staged.remove().await;
-            return Err(RegistryError::NotFound);
+        let refused = match open.get(name) {
+            Some(current) if Arc::ptr_eq(&current.db, &expected.db) => None,
+            Some(_) => Some(RegistryError::Changed),
+            None => Some(RegistryError::NotFound),
         };
+        if let Some(err) = refused {
+            staged.remove().await;
+            return Err(err);
+        }
+        let old = open.remove(name).expect("looked up above, under the same lock");
         old.set_closing(true);
         let placed = async {
             for suffix in ["-wal", "-tshm"] {
@@ -688,4 +699,35 @@ fn fold_copy(copy: &Path) -> anyhow::Result<Vec<u8>> {
     snapshot.connect()?.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None })?;
     drop(snapshot);
     Ok(std::fs::read(copy)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn script(registry: &Registry, name: &str, sql: &str) -> anyhow::Result<()> {
+        let db = registry.open(name, false).await.map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || Ok(Conn::open(&db.db, &db.internal_options())?.execute_script(&sql)?)).await?
+    }
+
+    #[tokio::test]
+    async fn a_restore_never_replaces_a_database_made_again_under_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path().to_path_buf(), Limits::default(), BackupPolicy::default(), Synchronous::default());
+        registry.create("app", Limits::default()).await.unwrap();
+        script(&registry, "app", "CREATE TABLE old (x); INSERT INTO old VALUES (1)").await.unwrap();
+        let held = registry.open("app", false).await.unwrap();
+        let staged = registry.stage("app", registry.snapshot("app").await.unwrap().bytes).await.unwrap();
+
+        // Deleted and made again while the restore ran.
+        registry.delete("app").await.unwrap();
+        registry.create("app", Limits::default()).await.unwrap();
+        script(&registry, "app", "CREATE TABLE fresh (x)").await.unwrap();
+
+        let replaced = registry.replace("app", &held, staged).await;
+        assert!(matches!(replaced, Err(RegistryError::Changed)), "{replaced:?}");
+        script(&registry, "app", "SELECT * FROM fresh").await.expect("the new database is as it was");
+        assert!(script(&registry, "app", "SELECT * FROM old").await.is_err(), "the restore's copy did not move in");
+    }
 }
