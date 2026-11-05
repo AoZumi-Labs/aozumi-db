@@ -510,12 +510,11 @@ impl Backups {
         (held, stored)
     }
 
-    /// The store keys of every backup of a database and its WAL, listed
-    /// under the database's backup lock, so no shipping round is mid-upload.
+    /// The store keys of every backup of a database and its WAL. The caller
+    /// holds the database's backup lock (`lock`), so no shipping round is
+    /// mid-upload.
     pub async fn backup_keys(&self, db: &str) -> Result<Vec<String>, BackupError> {
         self.config()?;
-        let lock = self.lock(db);
-        let _held = lock.lock().await;
         let mut keys = Vec::new();
         for snapshot in self.list(db).await? {
             if snapshot.kind == Kind::Scheduled {

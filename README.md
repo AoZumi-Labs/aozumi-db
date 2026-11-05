@@ -170,9 +170,10 @@ curl -X DELETE "localhost:8080/v1/databases/notes?backups=delete" -H "authorizat
 ```
 
 Two downloads are sent at a time; each holds its backup in memory until it
-is sent. Deleting with `?backups=delete` lists the backups there at that
-moment and deletes them in the background, so a database created again under
-the name keeps its own.
+is sent. Deleting with `?backups=delete` lists the backups there before it
+deletes the database, and deletes them in the background; the name is free
+again only after the listing, so a database created again under it keeps its
+own. A store that cannot be listed fails the delete, and nothing is deleted.
 
 ### Restoring in place
 

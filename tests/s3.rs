@@ -28,6 +28,8 @@ struct Fake {
     imds_calls: usize,
     /// Every upload fails, as when the bucket refuses writes.
     fail_puts: bool,
+    /// Every listing fails, as when the bucket cannot be reached.
+    fail_lists: bool,
     /// Requests with this method whose path and query contain the text wait
     /// at the gate until it opens.
     hold: Option<(Method, String, Arc<Gate>)>,
@@ -131,6 +133,7 @@ async fn handle(state: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) ->
             fake.objects.insert(key, body);
             reply(StatusCode::OK, "")
         }
+        Method::GET if key.is_empty() && fake.fail_lists => reply(StatusCode::INTERNAL_SERVER_ERROR, "<Error><Code>InternalError</Code></Error>"),
         Method::GET if key.is_empty() => list(&fake.objects, parts.uri.query().unwrap_or("")),
         Method::GET => match fake.objects.get(&key) {
             Some(bytes) => reply(StatusCode::OK, bytes.clone()),
@@ -355,6 +358,65 @@ async fn a_restore_in_place_runs_to_its_end_when_the_client_hangs_up() {
     assert_eq!(count, "1", "restored although its client hung up");
     let results = server.run(Some(&app), vec![execute("INSERT INTO t VALUES (3)")]).await;
     assert_eq!(results[0]["type"], "ok", "{}", results[0]);
+}
+
+#[tokio::test]
+async fn deleting_with_backups_lists_them_before_the_name_is_free() {
+    let (addr, fake) = fake_s3().await;
+    let target = BackupTarget::s3(options(addr, "backups", static_key())).unwrap();
+    let server = TestServer::with_backup_target(target, 5, None).await;
+    server.database("app").await;
+    let (status, old) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{old}");
+    let old_key = format!("team/prod/app/{}.manual.db", old["id"].as_str().unwrap());
+    assert!(fake.lock().unwrap().objects.contains_key(&old_key));
+
+    // Listing the database's backups waits at a gate, and meanwhile the name is asked for again.
+    let gate = Gate::new();
+    fake.lock().unwrap().hold = Some((Method::GET, "list-type=2".to_string(), gate.clone()));
+    let delete = server.admin(Method::DELETE, "/v1/databases/app?backups=delete", None);
+    let meanwhile = async {
+        gate.arrived.notified().await;
+        let made = server.admin(Method::POST, "/v1/databases", Some(json!({"name": "app"}))).await;
+        gate.open();
+        made
+    };
+    let ((deleted, _), (made, body)) = tokio::join!(delete, meanwhile);
+    assert_eq!(made, StatusCode::CONFLICT, "the name is free only once its backups are listed: {body}");
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+
+    // Made again, the database keeps its own backups; the old one's go.
+    server.database("app").await;
+    let (status, new) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{new}");
+    let new_key = format!("team/prod/app/{}.manual.db", new["id"].as_str().unwrap());
+    for _ in 0..250 {
+        if !fake.lock().unwrap().objects.contains_key(&old_key) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let objects = fake.lock().unwrap().objects.keys().cloned().collect::<Vec<_>>();
+    assert!(!objects.contains(&old_key), "{objects:?}");
+    assert!(objects.contains(&new_key), "{objects:?}");
+}
+
+#[tokio::test]
+async fn a_delete_that_cannot_list_the_backups_deletes_nothing() {
+    let (addr, fake) = fake_s3().await;
+    let target = BackupTarget::s3(options(addr, "backups", static_key())).unwrap();
+    let server = TestServer::with_backup_target(target, 5, None).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+
+    fake.lock().unwrap().fail_lists = true;
+    let (status, body) = server.admin(Method::DELETE, "/v1/databases/app?backups=delete", None).await;
+    assert!(status.is_server_error(), "{status}: {body}");
+    assert_eq!(scalar(&server.run(Some(&app), vec![execute("SELECT count(*) FROM t")]).await), "1", "the database is still there");
+
+    fake.lock().unwrap().fail_lists = false;
+    let (status, body) = server.admin(Method::DELETE, "/v1/databases/app?backups=delete", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 #[test]

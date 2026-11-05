@@ -748,20 +748,29 @@ async fn delete_database(state: &Arc<State>, name: &str, query: Option<&str>) ->
         Some("backups=delete") => true,
         Some(_) => return text(StatusCode::BAD_REQUEST, "a delete takes `?backups=delete` or `?backups=keep`"),
     };
+    // Held across the delete, so no snapshot or WAL shipping of the database
+    // runs meanwhile, and a database made again under the name starts its
+    // backups only after this one's were listed.
+    let lock = state.backups.lock(name);
+    let _backing_up = lock.lock().await;
+    // Listed before anything is deleted: when the store cannot be listed,
+    // the delete fails and changes nothing.
+    let keys = match with_backups {
+        false => None,
+        true => match state.backups.backup_keys(name).await {
+            Ok(keys) => Some(keys),
+            Err(BackupError::NotConfigured) => None,
+            Err(err) => return backup_error(err),
+        },
+    };
     match state.registry.delete(name).await {
         Ok(()) => {
             state.streams.close_database(name).await;
             state.rates.forget(name);
             state.backups.forget(name).await;
-            if with_backups {
-                match state.backups.backup_keys(name).await {
-                    Ok(keys) => {
-                        let (state, name) = (state.clone(), name.to_string());
-                        tokio::spawn(async move { state.backups.delete_keys(&name, keys).await });
-                    }
-                    Err(BackupError::NotConfigured) => {}
-                    Err(err) => return backup_error(err),
-                }
+            if let Some(keys) = keys {
+                let (state, name) = (state.clone(), name.to_string());
+                tokio::spawn(async move { state.backups.delete_keys(&name, keys).await });
             }
             Response::builder().status(StatusCode::NO_CONTENT).body(full(Bytes::new())).unwrap()
         }
