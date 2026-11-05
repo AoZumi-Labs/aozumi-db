@@ -201,6 +201,7 @@ fn production_config(dir: &std::path::Path) -> aozumi_db::Config {
         keep: 48,
         every: Some(Duration::from_secs(3600)),
         wal_every: Some(Duration::from_secs(5)),
+        prune_every: Duration::from_secs(300),
     });
     config.default_limits = aozumi_db::Limits { max_size_bytes: Some(268_435_456), max_statement_ms: Some(5000), max_requests_per_second: None };
     config
