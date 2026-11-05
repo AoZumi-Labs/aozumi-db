@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use common::*;
 use hyper::{Method, StatusCode};
@@ -17,10 +17,6 @@ async fn pitr_server() -> (tempfile::TempDir, TestServer) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Backups { dir: dir.path().to_path_buf(), keep: 10, every: None, wal: Some(SHIP_EVERY) };
     (dir, TestServer::with_backups(&cfg).await)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 /// Note the time between two writes, well clear of both.

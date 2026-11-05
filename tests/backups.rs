@@ -45,10 +45,6 @@ async fn count(server: &TestServer, token: &str) -> Value {
     scalar(&server.run(Some(token), vec![execute("SELECT count(*) FROM t")]).await)
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
 async fn listing(server: &TestServer, db: &str) -> Value {
     let (status, body) = server.admin(Method::GET, &format!("/v1/databases/{db}/backups"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");

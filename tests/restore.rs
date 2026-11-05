@@ -3,15 +3,11 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use common::*;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
 
 fn store(wal: Option<Duration>) -> (tempfile::TempDir, Backups) {
     let dir = tempfile::tempdir().unwrap();
