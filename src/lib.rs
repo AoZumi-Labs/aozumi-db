@@ -128,6 +128,17 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
                 state.backups.run_scheduled(&state.registry).await;
             }
         });
+    } else if let Some(every) = state.backups.prune_every() {
+        // No schedule prunes as it goes, so backups age out on a timer.
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.prune_all(&state.registry).await;
+            }
+        });
     }
     loop {
         let (stream, _) = listener.accept().await?;
