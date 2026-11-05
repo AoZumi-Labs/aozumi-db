@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aozumi_db::{BackupTarget, Credentials, S3Options};
 use bytes::Bytes;
@@ -27,6 +28,26 @@ struct Fake {
     imds_calls: usize,
     /// Every upload fails, as when the bucket refuses writes.
     fail_puts: bool,
+    /// Requests with this method whose path and query contain the text wait
+    /// at the gate until it opens.
+    hold: Option<(Method, String, Arc<Gate>)>,
+}
+
+/// Where held requests wait: each says it arrived, then waits for `open`.
+struct Gate {
+    arrived: tokio::sync::Notify,
+    opened: tokio::sync::Semaphore,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { arrived: tokio::sync::Notify::new(), opened: tokio::sync::Semaphore::new(0) })
+    }
+
+    /// Let every held request through, and every later one.
+    fn open(&self) {
+        self.opened.close();
+    }
 }
 
 async fn fake_s3() -> (SocketAddr, Arc<Mutex<Fake>>) {
@@ -91,6 +112,11 @@ async fn handle(state: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) ->
     let payload_hash = hex::encode(Sha256::digest(&body));
     if header("x-amz-content-sha256").as_deref() != Some(payload_hash.as_str()) || header("x-amz-date").is_none() {
         return reply(StatusCode::BAD_REQUEST, "<Error><Code>XAmzContentSHA256Mismatch</Code></Error>");
+    }
+    let gate = state.lock().unwrap().hold.as_ref().filter(|(method, part, _)| *method == parts.method && parts.uri.to_string().contains(part.as_str())).map(|(_, _, gate)| gate.clone());
+    if let Some(gate) = gate {
+        gate.arrived.notify_one();
+        let _ = gate.opened.acquire().await;
     }
     let mut fake = state.lock().unwrap();
     fake.seen.push((key_id.to_string(), header("x-amz-security-token")));
@@ -284,6 +310,51 @@ async fn a_restore_in_place_that_cannot_store_its_undo_backup_changes_nothing() 
     let (_, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
     assert_eq!(listed["backups"].as_array().unwrap().len(), 1, "{listed}");
     assert!(listed["status"]["last_failure"]["message"].as_str().unwrap().contains("InternalError"), "{listed}");
+}
+
+#[tokio::test]
+async fn a_restore_in_place_runs_to_its_end_when_the_client_hangs_up() {
+    let (addr, fake) = fake_s3().await;
+    let target = BackupTarget::s3(options(addr, "backups", static_key())).unwrap();
+    let server = TestServer::with_backup_target(target, 5, None).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    let (status, body) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
+
+    // The undo backup's upload waits at a gate.
+    let gate = Gate::new();
+    fake.lock().unwrap().hold = Some((Method::PUT, ".before-restore.db".to_string(), gate.clone()));
+    let stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let request = Request::post("/v1/databases/app/restore")
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {SECRET}"))
+        .body(Full::new(Bytes::from(json!({"backup": "latest"}).to_string())))
+        .unwrap();
+    let response = tokio::spawn(async move { sender.send_request(request).await });
+    gate.arrived.notified().await;
+
+    // The client hangs up while the undo backup uploads, and the upload goes on.
+    response.abort();
+    connection.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    gate.open();
+
+    // The restore still ends as one: the database is the backup again, and takes writes.
+    let mut count = json!(null);
+    for _ in 0..100 {
+        count = scalar(&server.run(Some(&app), vec![execute("SELECT count(*) FROM t")]).await);
+        if count == "1" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(count, "1", "restored although its client hung up");
+    let results = server.run(Some(&app), vec![execute("INSERT INTO t VALUES (3)")]).await;
+    assert_eq!(results[0]["type"], "ok", "{}", results[0]);
 }
 
 #[test]
