@@ -278,6 +278,40 @@ async fn backups_asked_for_never_push_out_the_point_in_time_history() {
 }
 
 #[tokio::test]
+async fn backups_age_out_without_a_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let backup = aozumi_db::BackupConfig {
+        target: aozumi_db::BackupTarget::directory(store.clone()),
+        keep: 10,
+        every: None,
+        wal_every: None,
+        prune_every: Duration::from_millis(100),
+    };
+    let server = TestServer::with_backup(backup).await;
+    server.database("app").await;
+    assert_eq!(policy(&server, "app", json!({"retention_hours": 1})).await.0, StatusCode::OK);
+    let (_, asked) = snapshot(&server, "app").await;
+    let asked = asked["id"].as_str().unwrap().to_string();
+    let real = file_of(&store, "app", &asked);
+    let old = plant(&store, "app", &real, 5 * HOUR_MS);
+    let older = plant(&store, "app", &real, 6 * HOUR_MS);
+
+    // No backup is taken from here on.
+    let mut left = kept(&server, "app").await;
+    for _ in 0..250 {
+        if !ids(&left).contains(&older.as_str()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        left = kept(&server, "app").await;
+    }
+    assert!(!ids(&left).contains(&older.as_str()), "aged out with no schedule: {left:?}");
+    assert!(ids(&left).contains(&old.as_str()), "the newest from before the window stays: {left:?}");
+    assert!(ids(&left).contains(&asked.as_str()), "{left:?}");
+}
+
+#[tokio::test]
 async fn spacing_outlasts_the_backup_it_counts_from() {
     let (_dir, cfg) = store(10, None, None);
     let server = TestServer::with_backups(&cfg).await;
@@ -301,6 +335,7 @@ async fn a_server_wide_default_retention_covers_databases_without_their_own() {
         keep: 1,
         every: None,
         wal_every: None,
+        prune_every: PRUNE_EVERY,
     };
     let server = TestServer::with_secret_and(move |c| {
         c.backup = Some(backup);

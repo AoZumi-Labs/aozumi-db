@@ -45,6 +45,10 @@ pub struct BackupConfig {
     /// Ship committed WAL frames this often, for point-in-time restore.
     /// `None` = off.
     pub wal_every: Option<Duration>,
+    /// Without a schedule (`every` is `None`), how often backups are pruned
+    /// anyway, so they still age out of their database's retention window.
+    /// A schedule prunes on each round.
+    pub prune_every: Duration,
 }
 
 pub struct BackupTarget(Store);
@@ -363,6 +367,12 @@ impl Backups {
 
     pub fn wal_every(&self) -> Option<Duration> {
         self.config.as_ref().and_then(|c| c.wal_every)
+    }
+
+    /// How often to prune on a server without a schedule; `None` with one,
+    /// or without backups.
+    pub fn prune_every(&self) -> Option<Duration> {
+        self.config.as_ref().filter(|c| c.every.is_none()).map(|c| c.prune_every)
     }
 
     fn config(&self) -> Result<&BackupConfig, BackupError> {
@@ -702,6 +712,20 @@ impl Backups {
             }
         }
         Ok(())
+    }
+
+    /// Age every database's backups out of its retention window, on a server
+    /// without a schedule, whose rounds would do it otherwise.
+    pub async fn prune_all(&self, registry: &Registry) {
+        let names = match registry.list().await {
+            Ok(names) => names,
+            Err(err) => return eprintln!("aozumi-db: pruning: cannot list databases: {err:?}"),
+        };
+        for name in names {
+            if let Err(err) = self.prune_unchanged(registry, &name).await {
+                eprintln!("aozumi-db: pruning the backups of {name} failed: {err:?}");
+            }
+        }
     }
 
     async fn prune_unchanged(&self, registry: &Registry, db: &str) -> Result<(), BackupError> {

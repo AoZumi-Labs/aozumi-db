@@ -224,8 +224,9 @@ curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Beare
 - `retention_hours` keeps every backup taken in that many hours, plus the
   newest scheduled one from before, where the window's history starts, so a
   database can always be restored to any moment in the window. Backups age out
-  on the schedule even while the database is unchanged, and the newest one is
-  never deleted. Without it, backups are kept by count.
+  on the schedule even while the database is unchanged (every 5 minutes on a
+  server without a schedule), and the newest one is never deleted. Without it,
+  backups are kept by count.
 - `manual_every_seconds` refuses a manual backup that comes sooner than that
   after the last one: `429` with `retry-after`. The last one counts even once
   pruning has deleted it, until the server restarts.

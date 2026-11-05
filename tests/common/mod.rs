@@ -14,6 +14,10 @@ use tempfile::TempDir;
 
 pub const SECRET: &str = "test-secret-do-not-use";
 
+/// Pruning without a schedule, in tests that do not look at it: after
+/// startup, never within a test.
+pub const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+
 pub struct TestServer {
     pub addr: SocketAddr,
     pub dir: TempDir,
@@ -48,11 +52,12 @@ impl TestServer {
 
     pub async fn with_backups(backups: &Backups) -> Self {
         let target = BackupTarget::directory(backups.dir.clone());
-        Self::with_backup(BackupConfig { target, keep: backups.keep, every: backups.every, wal_every: backups.wal }).await
+        let (keep, every, wal_every) = (backups.keep, backups.every, backups.wal);
+        Self::with_backup(BackupConfig { target, keep, every, wal_every, prune_every: PRUNE_EVERY }).await
     }
 
     pub async fn with_backup_target(target: BackupTarget, keep: usize, every: Option<Duration>) -> Self {
-        Self::with_backup(BackupConfig { target, keep, every, wal_every: None }).await
+        Self::with_backup(BackupConfig { target, keep, every, wal_every: None, prune_every: PRUNE_EVERY }).await
     }
 
     pub async fn with_backup(backup: BackupConfig) -> Self {
