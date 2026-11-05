@@ -161,6 +161,20 @@ curl -X POST localhost:8080/v1/databases -H "authorization: Bearer $AOZUMI_DB_SE
 Restores never overwrite a live database. A new machine pointed at the same
 backup store can restore every database it finds there.
 
+```bash
+# a backup as a database file, for sqlite3 or any SQLite tool
+curl -o notes.db localhost:8080/v1/databases/notes/backups/latest -H "authorization: Bearer $AOZUMI_DB_SECRET"
+
+# delete a database and its backups, WAL included (without the flag they stay)
+curl -X DELETE "localhost:8080/v1/databases/notes?backups=delete" -H "authorization: Bearer $AOZUMI_DB_SECRET"
+```
+
+Two downloads are sent at a time; each holds its backup in memory until it
+is sent. Deleting with `?backups=delete` lists the backups there before it
+deletes the database, and deletes them in the background; the name is free
+again only after the listing, so a database created again under it keeps its
+own. A store that cannot be listed fails the delete, and nothing is deleted.
+
 ### Restoring in place
 
 ```bash
@@ -270,13 +284,14 @@ asked for never cuts the point-in-time history.
 | `POST` | `/v1/databases` | admin | create `{"name"}`, optionally `"limits"` and `"restore": {"database", "backup" or "at"}` |
 | `GET` | `/v1/databases/{name}` | admin | size, limits and token generation |
 | `PATCH` | `/v1/databases/{name}/limits` | admin | change limits |
-| `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files |
+| `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files; `?backups=delete` deletes its backups too |
 | `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` at the current token generation |
 | `POST` | `/v1/databases/{name}/tokens/rotate` | admin | revoke every token of the database and close its streams → `{"name", "token_generation"}` |
 | `POST` | `/v1/databases/{name}/backups` | admin | back up now → `{"id", "size_bytes", "taken_ms", "kind": "manual"}` |
 | `GET` | `/v1/databases/{name}/backups` | admin | backups, newest first, the point-in-time window and the backups' `status` |
 | `PATCH` | `/v1/databases/{name}/backups` | admin | change the backup policy: `{"retention_hours", "manual_every_seconds", "manual_keep"}` |
 | `POST` | `/v1/databases/{name}/restore` | admin | restore in place from `{"backup"}` or `{"at"}` → `{"name", "restored_to_ms", "before_restore"}` |
+| `GET` | `/v1/databases/{name}/backups/{id}` | admin | a backup (`latest` or an id) as a database file, `application/vnd.sqlite3` |
 | `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
 | `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |
