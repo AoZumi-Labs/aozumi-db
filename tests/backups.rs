@@ -329,15 +329,18 @@ async fn scheduled_backups_skip_unchanged_databases_and_keep_the_newest() {
     }
     assert_eq!(list(&server, "app").await, settled, "no backups while the database is unchanged");
 
-    // The next tick backs up each change.
+    // Each change is backed up: by the next tick, or by two when a tick that
+    // looked just before the write also caught it.
     let mut newest = Vec::new();
     for i in 0..3 {
         server.run(Some(&app), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
-        server.backed_up_past("app", now_ms()).await;
+        server.settle_backups("app").await;
         newest.push(list(&server, "app").await[0].clone());
     }
     let kept = list(&server, "app").await;
-    assert_eq!(kept, [newest[2].clone(), newest[1].clone()], "only the newest two are kept");
+    assert_eq!(kept.len(), 2, "only the newest two are kept: {kept:?}");
+    assert_eq!(kept[0], newest[2], "the newest is the last change's");
+    assert!(!kept.contains(&newest[0]), "older ones go: {kept:?}");
 
     let (status, _) = restore(&server, "copy", "app", "latest").await;
     assert_eq!(status, StatusCode::CREATED);
