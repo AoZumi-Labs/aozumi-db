@@ -3,15 +3,11 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use common::*;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
 
 fn store(wal: Option<Duration>) -> (tempfile::TempDir, Backups) {
     let dir = tempfile::tempdir().unwrap();
@@ -82,11 +78,11 @@ async fn restoring_in_place_to_a_moment() {
     let server = TestServer::with_backups(&cfg).await;
     let app = server.database("app").await;
     server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.backed_up_past("app", now_ms()).await;
     let moment = now_ms();
     tokio::time::sleep(Duration::from_millis(50)).await;
     server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.backed_up_past("app", now_ms()).await;
 
     let (status, body) = restore(&server, "app", json!({"at": moment})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -95,7 +91,7 @@ async fn restoring_in_place_to_a_moment() {
 
     // Writes after the restore are shipped from it, as a new history.
     server.run(Some(&app), vec![execute("INSERT INTO t VALUES (3)")]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.backed_up_past("app", now_ms()).await;
     let (status, body) = server
         .admin(Method::POST, "/v1/databases", Some(json!({"name": "now", "restore": {"database": "app", "at": now_ms()}})))
         .await;

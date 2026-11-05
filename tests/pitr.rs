@@ -3,15 +3,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use common::*;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
 
 const SHIP_EVERY: Duration = Duration::from_millis(50);
-/// Comfortably longer than one shipping round.
-const SETTLE: Duration = Duration::from_millis(400);
 
 async fn pitr_server() -> (tempfile::TempDir, TestServer) {
     let dir = tempfile::tempdir().unwrap();
@@ -19,13 +17,10 @@ async fn pitr_server() -> (tempfile::TempDir, TestServer) {
     (dir, TestServer::with_backups(&cfg).await)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
-/// Note the time between two writes, well clear of both.
-async fn mark() -> u64 {
-    tokio::time::sleep(SETTLE).await;
+/// Note a time between two writes, well clear of both: after everything
+/// written to `db` so far is shipped, and 50 ms before the next write.
+async fn mark(server: &TestServer, db: &str) -> u64 {
+    server.backed_up_past(db, now_ms()).await;
     let at = now_ms();
     tokio::time::sleep(Duration::from_millis(50)).await;
     at
@@ -59,13 +54,13 @@ async fn restores_the_database_as_it_was_at_any_moment() {
     server.run(Some(&app), vec![execute("CREATE TABLE notes (body TEXT)")]).await;
     let insert = |body: &str| execute(&format!("INSERT INTO notes VALUES ('{body}')"));
 
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
     server.run(Some(&app), vec![insert("a")]).await;
-    let after_a = mark().await;
+    let after_a = mark(&server, "app").await;
     server.run(Some(&app), vec![insert("b")]).await;
-    let after_b = mark().await;
+    let after_b = mark(&server, "app").await;
     server.run(Some(&app), vec![insert("c"), execute("DELETE FROM notes WHERE body = 'a'")]).await;
-    let after_c = mark().await;
+    let after_c = mark(&server, "app").await;
 
     let (status, body) = restore_at(&server, "at-a", "app", json!(after_a)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -91,15 +86,18 @@ async fn point_in_time_survives_wal_checkpoints() {
     let (_dir, server) = pitr_server().await;
     let app = server.database("app").await;
     server.run(Some(&app), vec![execute("CREATE TABLE t (i INTEGER)")]).await;
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
 
     // One commit per row: well past the shipper's checkpoint threshold.
     let batch = |from: usize| (from..from + 800).map(|i| execute(&format!("INSERT INTO t VALUES ({i})"))).collect();
     server.run(Some(&app), batch(0)).await;
-    let middle = mark().await;
+    let middle = mark(&server, "app").await;
     server.run(Some(&app), batch(800)).await;
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
     let end = now_ms();
+    // The round that shipped the last write checkpoints after it, and the
+    // next round starts once it has.
+    server.backed_up_past("app", end).await;
 
     let wal = std::fs::metadata(server.dir.path().join("app.db-wal")).map(|m| m.len()).unwrap_or(0);
     assert!(wal < 4 * 1024 * 1024, "the shipper checkpointed the WAL ({wal} bytes)");
@@ -116,7 +114,7 @@ async fn every_restore_point_under_concurrent_writes_is_consistent() {
     let server = Arc::new(server);
     let app = server.database("app").await;
     server.run(Some(&app), vec![execute("CREATE TABLE t (i INTEGER)")]).await;
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
 
     let writer = {
         let (server, app) = (server.clone(), app.clone());
@@ -133,7 +131,7 @@ async fn every_restore_point_under_concurrent_writes_is_consistent() {
         points.push(now_ms());
     }
     writer.await.unwrap();
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
     points.push(now_ms());
 
     let mut last = -1;
@@ -157,10 +155,10 @@ async fn the_restore_window_is_reported_and_bad_times_are_refused() {
     let app = server.database("app").await;
     let before_anything = now_ms() - 60_000;
     server.run(Some(&app), vec![execute("CREATE TABLE t (i)")]).await;
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", now_ms()).await;
     server.run(Some(&app), vec![execute("INSERT INTO t VALUES (1)")]).await;
     let written = now_ms();
-    tokio::time::sleep(SETTLE).await;
+    server.backed_up_past("app", written).await;
 
     let (status, body) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");

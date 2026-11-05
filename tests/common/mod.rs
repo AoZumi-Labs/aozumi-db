@@ -167,7 +167,8 @@ impl TestServer {
     }
 }
 
-fn now_ms() -> u64 {
+/// Now, in unix milliseconds: the clock the server stamps backups with.
+pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 

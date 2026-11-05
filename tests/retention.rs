@@ -4,17 +4,13 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use common::*;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
 
 const HOUR_MS: u64 = 3_600_000;
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
 
 fn store(keep: usize, every: Option<Duration>, wal: Option<Duration>) -> (tempfile::TempDir, Backups) {
     let dir = tempfile::tempdir().unwrap();
