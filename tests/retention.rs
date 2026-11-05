@@ -230,6 +230,54 @@ async fn backups_asked_for_do_not_split_the_point_in_time_history() {
 }
 
 #[tokio::test]
+async fn backups_asked_for_never_push_out_the_point_in_time_history() {
+    // Kept by count, 2 a database, with WAL shipping on.
+    let (_dir, cfg) = store(2, None, Some(Duration::from_millis(50)));
+    let server = TestServer::with_backups(&cfg).await;
+    let app = server.database("app").await;
+    server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
+    let mut generation = None;
+    for _ in 0..250 {
+        generation = kept(&server, "app").await.into_iter().find(|(_, kind)| kind == "scheduled").map(|(id, _)| id);
+        if generation.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let generation = generation.expect("WAL shipping starts a generation");
+
+    let mut asked = Vec::new();
+    for _ in 0..3 {
+        let (status, body) = snapshot(&server, "app").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        asked.push(body["id"].as_str().unwrap().to_string());
+    }
+    let left = kept(&server, "app").await;
+    assert!(left.contains(&(generation.clone(), "scheduled".to_string())), "the generation WAL ships into stays: {left:?}");
+    let asked_left = left.iter().filter(|(_, kind)| kind == "manual").map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+    assert_eq!(asked_left, [asked[2].as_str(), asked[1].as_str()], "the newest 2 asked for: {left:?}");
+
+    // Every moment since the generation started still restores.
+    server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
+    let written = now_ms();
+    let mut latest = 0;
+    for _ in 0..250 {
+        latest = listing(&server, "app").await["point_in_time"]["latest_ms"].as_u64().unwrap_or(0);
+        if latest >= written {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(latest >= written, "the point-in-time window reaches the last write");
+    let (status, body) = server
+        .admin(Method::POST, "/v1/databases", Some(json!({"name": "at", "restore": {"database": "app", "at": latest}})))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = server.token("at").await;
+    assert_eq!(scalar(&server.run(Some(&token), vec![execute("SELECT count(*) FROM t")]).await), "2");
+}
+
+#[tokio::test]
 async fn a_server_wide_default_retention_covers_databases_without_their_own() {
     let dir = tempfile::tempdir().unwrap();
     let backup = aozumi_db::BackupConfig {

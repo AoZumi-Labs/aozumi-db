@@ -36,8 +36,9 @@ const MAX_UNSHIPPED_FRAMES: u64 = 16_384;
 
 pub struct BackupConfig {
     pub target: BackupTarget,
-    /// How many snapshots to keep per database; older ones are deleted,
-    /// with their WAL segments.
+    /// For databases without a retention window: how many of the server's
+    /// own snapshots to keep, and apart from them how many backups asked
+    /// for. Older ones are deleted, snapshots with their WAL segments.
     pub keep: usize,
     /// Snapshot every changed database this often. `None` = only on request.
     pub every: Option<Duration>,
@@ -220,7 +221,8 @@ pub struct Status {
     pub every_seconds: Option<u64>,
     /// How often committed WAL frames are shipped; `None` = no point-in-time restore.
     pub wal_every_ms: Option<u64>,
-    /// Snapshots kept per database.
+    /// Without a retention window, the server's own snapshots kept per
+    /// database, and apart from them the backups asked for.
     pub keep: usize,
     /// The newest snapshot or WAL segment in the store.
     pub last_backup_ms: Option<u64>,
@@ -702,8 +704,10 @@ impl Backups {
     /// Delete the snapshots the policy no longer keeps, with their WAL. With
     /// a retention window: everything taken inside it, and the newest
     /// scheduled snapshot from before it, where the window's history starts.
-    /// Without: the newest `keep`. Either way, at most `manual_keep` of the
-    /// backups asked for.
+    /// Without: the newest `keep` scheduled snapshots, and apart from them the
+    /// newest `keep` backups asked for, so asking for backups never prunes
+    /// the generation WAL is shipped into. Either way, at most `manual_keep`
+    /// of the backups asked for.
     async fn prune(&self, db: &str, policy: &BackupPolicy) -> Result<(), BackupError> {
         let config = self.config()?;
         let snapshots = self.list(db).await?;
@@ -718,7 +722,11 @@ impl Backups {
                 doomed.extend(snapshots.iter().filter(|s| asked(s) && s.taken_ms < cutoff));
                 doomed.extend(snapshots.iter().filter(|s| !asked(s) && s.taken_ms < cutoff).skip(1));
             }
-            None => doomed.extend(snapshots.iter().skip(config.keep.max(1))),
+            None => {
+                let keep = config.keep.max(1);
+                doomed.extend(snapshots.iter().filter(|s| !asked(s)).skip(keep));
+                doomed.extend(snapshots.iter().filter(asked).skip(keep));
+            }
         }
         doomed.sort_by(|a, b| a.id.cmp(&b.id));
         doomed.dedup_by(|a, b| a.id == b.id);

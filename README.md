@@ -63,7 +63,7 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `AOZUMI_DB_DEV` | unset | `1` runs without a secret: no auth, one database named `default` |
 | `AOZUMI_DB_BACKUP_URL` | unset (no backups) | `s3://bucket/prefix` or `file:///path` |
 | `AOZUMI_DB_BACKUP_EVERY` | `300` | Seconds between backups of changed databases; `0` = only on request |
-| `AOZUMI_DB_BACKUP_KEEP` | `24` | Backups kept per database |
+| `AOZUMI_DB_BACKUP_KEEP` | `24` | Scheduled backups kept per database without a retention window, and apart from them as many asked for |
 | `AOZUMI_DB_BACKUP_WAL_MS` | `1000` | Ship the WAL this often for point-in-time restore; `0` = off |
 | `AOZUMI_DB_BACKUP_RETENTION_HOURS` | unset | Keep the backups of databases without a policy of their own for this many hours, instead of by count |
 | `AOZUMI_DB_S3_ENDPOINT` | AWS S3 | An S3-compatible endpoint, e.g. Cloudflare R2 or MinIO |
@@ -211,8 +211,9 @@ curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI
 
 ### A database's backup policy
 
-By default a database keeps the newest `AOZUMI_DB_BACKUP_KEEP` backups, and
-backups can be asked for at any time. A database's own policy changes that:
+By default a database keeps its newest `AOZUMI_DB_BACKUP_KEEP` scheduled backups,
+and apart from them as many of the backups asked for, which can be asked for at
+any time. A database's own policy changes that:
 
 ```bash
 curl -X PATCH localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI_DB_SECRET" \
