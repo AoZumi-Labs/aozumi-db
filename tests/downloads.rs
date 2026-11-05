@@ -95,7 +95,7 @@ async fn deleting_with_its_backups_removes_every_backup_and_wal_segment() {
         server.run(Some(&token), vec![execute("CREATE TABLE t (x)")]).await;
         for i in 0..3 {
             server.run(Some(&token), vec![execute(&format!("INSERT INTO t VALUES ({i})"))]).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            server.backed_up_past(name, now_ms()).await;
         }
         snapshot(&server, name).await;
     }
@@ -113,7 +113,9 @@ async fn deleting_with_its_backups_removes_every_backup_and_wal_segment() {
     let (_, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
     assert_eq!(listed["backups"], json!([]), "{listed}");
 
-    // A plain delete keeps them, as before.
+    // A plain delete keeps them, as before. Nothing the server reports would
+    // show a deletion that should never start, so this sleeps rather than
+    // waits: a slow run can miss such a deletion, but never fails for it.
     assert_eq!(server.admin(Method::DELETE, "/v1/databases/other", None).await.0, StatusCode::NO_CONTENT);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (_, listed) = server.admin(Method::GET, "/v1/databases/other/backups", None).await;
