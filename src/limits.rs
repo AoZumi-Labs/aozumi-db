@@ -1,4 +1,4 @@
-//! Per-database limits and the request-rate limiter.
+//! Per-database limits, backup policies and the request-rate limiter.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,6 +49,52 @@ impl Limits {
         }
         if self.max_requests_per_second.is_some_and(|rate| !(rate.is_finite() && rate > 0.0)) {
             return Err("max_requests_per_second must be a positive number, or null".into());
+        }
+        Ok(self)
+    }
+}
+
+/// How long a database's backups are kept, and how often and how many
+/// backups may be asked for (manual ones and those a restore in place takes).
+/// `None` means the server's way: snapshots kept by count
+/// (`AOZUMI_DB_BACKUP_KEEP`), and backups asked for whenever, without a cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupPolicy {
+    /// Keep every backup taken in this many hours, and the newest scheduled
+    /// one from before, where restoring to the window's start begins; prune
+    /// by age instead of by count.
+    pub retention_hours: Option<u64>,
+    /// A backup asked for comes at least this long after the last one.
+    pub manual_every_seconds: Option<u64>,
+    /// Keep at most this many backups asked for, newest first.
+    pub manual_keep: Option<usize>,
+}
+
+/// A change to a backup policy: a missing field keeps its value, `null` lifts it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPolicyPatch {
+    #[serde(default, deserialize_with = "present")]
+    retention_hours: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    manual_every_seconds: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    manual_keep: Option<Option<usize>>,
+}
+
+impl BackupPolicy {
+    pub fn apply(mut self, patch: &BackupPolicyPatch) -> Result<Self, String> {
+        if let Some(value) = patch.retention_hours {
+            self.retention_hours = value;
+        }
+        if let Some(value) = patch.manual_every_seconds {
+            self.manual_every_seconds = value;
+        }
+        if let Some(value) = patch.manual_keep {
+            self.manual_keep = value;
+        }
+        if self.retention_hours == Some(0) || self.manual_every_seconds == Some(0) || self.manual_keep == Some(0) {
+            return Err("backup policies must be positive, or null for the server's default".into());
         }
         Ok(self)
     }

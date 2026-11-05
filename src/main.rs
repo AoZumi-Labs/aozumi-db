@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, token_generation, BackupConfig, BackupTarget, Claims, Config, Limits, Synchronous};
+use aozumi_db::{mint_token, token_generation, BackupConfig, BackupPolicy, BackupTarget, Claims, Config, Limits, Synchronous};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
@@ -58,6 +58,7 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
 
     let mut config = Config::new(data_dir.clone(), secret);
     config.backup = backup_config()?;
+    config.default_backup_policy = default_backup_policy()?;
     config.default_limits = default_limits()?;
     config.synchronous = match std::env::var("AOZUMI_DB_SYNCHRONOUS").as_deref() {
         Err(_) | Ok("full") => Synchronous::Full,
@@ -104,7 +105,22 @@ fn backup_config() -> anyhow::Result<Option<BackupConfig>> {
         keep: keep.max(1) as usize,
         every: (every > 0).then(|| Duration::from_secs(every)),
         wal_every: (wal_ms > 0).then(|| Duration::from_millis(wal_ms)),
+        // Without a schedule, as often as the default schedule would run.
+        prune_every: Duration::from_secs(300),
     }))
+}
+
+/// `AOZUMI_DB_BACKUP_RETENTION_HOURS` keeps the backups of databases without
+/// a policy of their own by age instead of by count (`0` or unset = by count).
+fn default_backup_policy() -> anyhow::Result<BackupPolicy> {
+    let hours = match std::env::var("AOZUMI_DB_BACKUP_RETENTION_HOURS") {
+        Ok(value) => value.parse::<u64>().map_err(|_| anyhow::anyhow!("AOZUMI_DB_BACKUP_RETENTION_HOURS must be a whole number, got {value:?}"))?,
+        Err(_) => 0,
+    };
+    if hours > 0 {
+        eprintln!("aozumi-db: backups of databases without a policy of their own are kept {hours} hours");
+    }
+    Ok(BackupPolicy { retention_hours: (hours > 0).then_some(hours), ..Default::default() })
 }
 
 /// Limits for new databases. A 10 s statement limit by default, so one

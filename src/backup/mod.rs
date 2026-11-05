@@ -3,12 +3,13 @@
 //! A snapshot is a consistent copy of a database as one file, stored as
 //! `<database>/<id>.db`, or `<id>.manual.db` when it was asked for (see
 //! [`Kind`]); ids are zero-padded unix milliseconds, so they sort by age and
-//! say when the snapshot was taken. With WAL shipping on, each snapshot also
-//! starts a generation: the
-//! WAL frames committed after it, uploaded every few moments as segments
+//! say when the snapshot was taken. With WAL shipping on, each snapshot the
+//! server takes on its own also starts a generation: the WAL frames committed
+//! after it, uploaded every few moments as segments
 //! `<database>/wal/<snapshot id>/<segment no>-<shipped at ms>.wal`. Restoring
-//! to a time takes the newest snapshot at or before it and replays the
-//! page images of its segments shipped by then.
+//! to a time takes the newest generation at or before it and replays the
+//! page images of its segments shipped by then. A database's policy
+//! (`limits::BackupPolicy`) says how long its backups are kept.
 
 mod s3;
 
@@ -21,6 +22,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::engine::{Conn, WalPosition, FRAME_HEADER};
+use crate::limits::BackupPolicy;
 use crate::registry::{Fingerprint, OpenDb, Registry, RegistryError};
 
 pub use s3::{Credentials, S3Options};
@@ -34,14 +36,19 @@ const MAX_UNSHIPPED_FRAMES: u64 = 16_384;
 
 pub struct BackupConfig {
     pub target: BackupTarget,
-    /// How many snapshots to keep per database; older ones are deleted,
-    /// with their WAL segments.
+    /// For databases without a retention window: how many of the server's
+    /// own snapshots to keep, and apart from them how many backups asked
+    /// for. Older ones are deleted, snapshots with their WAL segments.
     pub keep: usize,
     /// Snapshot every changed database this often. `None` = only on request.
     pub every: Option<Duration>,
     /// Ship committed WAL frames this often, for point-in-time restore.
     /// `None` = off.
     pub wal_every: Option<Duration>,
+    /// Without a schedule (`every` is `None`), how often backups are pruned
+    /// anyway, so they still age out of their database's retention window.
+    /// A schedule prunes on each round.
+    pub prune_every: Duration,
 }
 
 pub struct BackupTarget(Store);
@@ -218,7 +225,8 @@ pub struct Status {
     pub every_seconds: Option<u64>,
     /// How often committed WAL frames are shipped; `None` = no point-in-time restore.
     pub wal_every_ms: Option<u64>,
-    /// Snapshots kept per database.
+    /// Without a retention window, the server's own snapshots kept per
+    /// database, and apart from them the backups asked for.
     pub keep: usize,
     /// The newest snapshot or WAL segment in the store.
     pub last_backup_ms: Option<u64>,
@@ -228,6 +236,8 @@ pub struct Status {
     /// The last attempt to store a snapshot or WAL that failed, unless one
     /// succeeded after it.
     pub last_failure: Option<Failure>,
+    /// The database's own policy (`PATCH .../backups`).
+    pub policy: BackupPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +275,8 @@ pub enum BackupError {
     NotFound,
     InvalidId,
     InvalidTime,
+    /// The database's policy spaces manual backups; the last one was too recent.
+    TooSoon { retry_after: Duration },
     Registry(RegistryError),
     Other(anyhow::Error),
 }
@@ -309,6 +321,10 @@ pub struct Backups {
     /// Snapshots and WAL shipping of one database never overlap.
     locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     health: std::sync::Mutex<HashMap<String, Health>>,
+    /// When each database's last manual backup was taken, since this server
+    /// started: its policy's spacing counts from it even once pruning has
+    /// deleted the backup.
+    last_manual: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl Backups {
@@ -320,6 +336,7 @@ impl Backups {
             cursors: Mutex::new(HashMap::new()),
             locks: std::sync::Mutex::new(HashMap::new()),
             health: std::sync::Mutex::new(HashMap::new()),
+            last_manual: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -352,6 +369,12 @@ impl Backups {
         self.config.as_ref().and_then(|c| c.wal_every)
     }
 
+    /// How often to prune on a server without a schedule; `None` with one,
+    /// or without backups.
+    pub fn prune_every(&self) -> Option<Duration> {
+        self.config.as_ref().filter(|c| c.every.is_none()).map(|c| c.prune_every)
+    }
+
     fn config(&self) -> Result<&BackupConfig, BackupError> {
         self.config.as_ref().ok_or(BackupError::NotConfigured)
     }
@@ -363,7 +386,29 @@ impl Backups {
     pub async fn snapshot(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
         let lock = self.lock(db);
         let _held = lock.lock().await;
-        self.snapshot_locked(registry, db, kind).await
+        if kind == Kind::Manual {
+            self.check_spacing(registry, db).await?;
+        }
+        let taken = self.snapshot_locked(registry, db, kind).await;
+        if let (Kind::Manual, Ok(info)) = (kind, &taken) {
+            self.last_manual.lock().unwrap().insert(db.to_string(), info.taken_ms);
+        }
+        taken
+    }
+
+    /// Refuses a manual backup that comes sooner after the last one than the
+    /// database's policy allows. The last one is the newest the store holds,
+    /// or the last this server took, whichever is later: a retention window
+    /// shorter than the spacing can prune it first.
+    async fn check_spacing(&self, registry: &Registry, db: &str) -> Result<(), BackupError> {
+        let Some(every) = registry.open(db, false).await?.backup_policy.manual_every_seconds else { return Ok(()) };
+        let every_ms = every.saturating_mul(1000);
+        let stored = self.list(db).await?.into_iter().find(|b| b.kind == Kind::Manual).map(|b| b.taken_ms);
+        let remembered = self.last_manual.lock().unwrap().get(db).copied();
+        match stored.max(remembered).map(|taken| now_ms().saturating_sub(taken)) {
+            Some(since) if since < every_ms => Err(BackupError::TooSoon { retry_after: Duration::from_millis(every_ms - since) }),
+            _ => Ok(()),
+        }
     }
 
     async fn snapshot_locked(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
@@ -379,15 +424,18 @@ impl Backups {
 
     async fn take_snapshot(&self, registry: &Registry, db: &str, kind: Kind) -> Result<BackupInfo, BackupError> {
         let config = self.config()?;
+        let policy = registry.open(db, false).await?.backup_policy;
         let snapshot = registry.snapshot(db).await?;
         let id = self.next_id().await;
         let info = BackupInfo::new(id.clone(), snapshot.bytes.len() as u64, kind);
         config.target.put(&snapshot_key(db, &id, kind), snapshot.bytes).await?;
-        if config.wal_every.is_some() {
+        // Only the server's own snapshots start a WAL generation, so pruning
+        // a backup someone asked for never cuts the point-in-time history.
+        if config.wal_every.is_some() && kind == Kind::Scheduled {
             let cursor = Cursor { generation: id, wal_seq: snapshot.wal.seq, next_frame: snapshot.wal.frame + 1, next_segment: 0 };
             self.cursors.lock().await.insert(db.to_string(), cursor);
         }
-        self.prune(db).await?;
+        self.prune(db, &policy).await?;
         Ok(info)
     }
 
@@ -396,6 +444,7 @@ impl Backups {
         self.cursors.lock().await.remove(db);
         self.seen.lock().await.remove(db);
         self.health.lock().unwrap().remove(db);
+        self.last_manual.lock().unwrap().remove(db);
     }
 
     /// Snapshots of one database, newest first.
@@ -414,14 +463,17 @@ impl Backups {
     }
 
     /// A database's backups, newest first, its point-in-time window, and the
-    /// status of its backups.
-    pub async fn listing(&self, db: &str) -> Result<Listing, BackupError> {
+    /// status of its backups. A deleted database's backups have no policy.
+    pub async fn listing(&self, registry: &Registry, db: &str) -> Result<Listing, BackupError> {
         let config = self.config()?;
         let backups = self.list(db).await?;
         let point_in_time = self.window_of(db, &backups).await?;
-        let last_backup_ms = match &point_in_time {
-            Some(window) => Some(window.latest_ms),
-            None => backups.first().map(|b| b.taken_ms),
+        let newest = backups.first().map(|b| b.taken_ms);
+        let last_backup_ms = point_in_time.as_ref().map(|w| w.latest_ms).max(newest);
+        let policy = match registry.open(db, false).await {
+            Ok(open) => open.backup_policy,
+            Err(RegistryError::NotFound) => BackupPolicy::default(),
+            Err(err) => return Err(err.into()),
         };
         let (up_to_date_ms, last_failure) = match self.health.lock().unwrap().get(db) {
             Some(health) => (health.up_to_date_ms, health.last_failure.clone()),
@@ -434,17 +486,20 @@ impl Backups {
             last_backup_ms,
             up_to_date_ms,
             last_failure,
+            policy,
         };
         Ok(Listing { backups, point_in_time, status })
     }
 
     /// The times a database with these snapshots (newest first) can be
-    /// restored to, with WAL shipping on.
+    /// restored to, with WAL shipping on: from its oldest generation to the
+    /// last WAL shipped in its newest.
     async fn window_of(&self, db: &str, snapshots: &[BackupInfo]) -> Result<Option<Window>, BackupError> {
         if self.config()?.wal_every.is_none() {
             return Ok(None);
         }
-        let (Some(newest), Some(oldest)) = (snapshots.first(), snapshots.last()) else { return Ok(None) };
+        let generations = snapshots.iter().filter(|s| s.kind == Kind::Scheduled).collect::<Vec<_>>();
+        let (Some(newest), Some(oldest)) = (generations.first(), generations.last()) else { return Ok(None) };
         let segments = self.segments(db, &newest.id).await?;
         let shipped = segments.last().map(|s| s.shipped_ms).unwrap_or(0);
         Ok(Some(Window { earliest_ms: oldest.taken_ms, latest_ms: shipped.max(newest.taken_ms) }))
@@ -472,11 +527,15 @@ impl Backups {
     /// The database as it was at `at_ms`: the newest snapshot at or before
     /// it, plus the WAL shipped after that snapshot and by that time.
     pub async fn fetch_at(&self, db: &str, at_ms: u64) -> Result<Restored, BackupError> {
-        let target = &self.config()?.target;
+        let config = self.config()?;
+        let target = &config.target;
+        // With WAL shipping, from the generation that covers the time; any
+        // snapshot otherwise.
         let snapshot = self
             .list(db)
             .await?
             .into_iter()
+            .filter(|s| config.wal_every.is_none() || s.kind == Kind::Scheduled)
             .find(|s| s.taken_ms <= at_ms)
             .ok_or(BackupError::NotFound)?;
         let mut bytes = target.get(&snapshot_key(db, &snapshot.id, snapshot.kind)).await?.ok_or(BackupError::NotFound)?;
@@ -521,6 +580,10 @@ impl Backups {
             if self.seen.lock().await.get(&name) == Some(&fingerprint) {
                 // Unchanged since its last scheduled snapshot, which holds it all.
                 self.mark_up_to_date(&name, checked);
+                // Backups still age out of a retention window.
+                if let Err(err) = self.prune_unchanged(registry, &name).await {
+                    eprintln!("aozumi-db: pruning the backups of {name} failed: {err:?}");
+                }
                 continue;
             }
             match self.snapshot(registry, &name, Kind::Scheduled).await {
@@ -651,11 +714,64 @@ impl Backups {
         Ok(())
     }
 
-    async fn prune(&self, db: &str) -> Result<(), BackupError> {
+    /// Age every database's backups out of its retention window, on a server
+    /// without a schedule, whose rounds would do it otherwise.
+    pub async fn prune_all(&self, registry: &Registry) {
+        let names = match registry.list().await {
+            Ok(names) => names,
+            Err(err) => return eprintln!("aozumi-db: pruning: cannot list databases: {err:?}"),
+        };
+        for name in names {
+            if let Err(err) = self.prune_unchanged(registry, &name).await {
+                eprintln!("aozumi-db: pruning the backups of {name} failed: {err:?}");
+            }
+        }
+    }
+
+    async fn prune_unchanged(&self, registry: &Registry, db: &str) -> Result<(), BackupError> {
+        let policy = registry.open(db, false).await?.backup_policy;
+        if policy.retention_hours.is_none() {
+            return Ok(());
+        }
+        let lock = self.lock(db);
+        let _held = lock.lock().await;
+        self.prune(db, &policy).await
+    }
+
+    /// Delete the snapshots the policy no longer keeps, with their WAL. With
+    /// a retention window: everything taken inside it, and the newest
+    /// scheduled snapshot from before it, where the window's history starts.
+    /// Without: the newest `keep` scheduled snapshots, and apart from them the
+    /// newest `keep` backups asked for, so asking for backups never prunes
+    /// the generation WAL is shipped into. Either way, at most `manual_keep`
+    /// of the backups asked for.
+    async fn prune(&self, db: &str, policy: &BackupPolicy) -> Result<(), BackupError> {
         let config = self.config()?;
-        for old in self.list(db).await?.into_iter().skip(config.keep.max(1)) {
-            for segment in self.segments(db, &old.id).await? {
-                config.target.delete(&format!("{}{}", wal_dir(db, &old.id), segment.name)).await?;
+        let snapshots = self.list(db).await?;
+        let asked = |s: &&BackupInfo| s.kind != Kind::Scheduled;
+        let mut doomed: Vec<&BackupInfo> = Vec::new();
+        if let Some(cap) = policy.manual_keep {
+            doomed.extend(snapshots.iter().filter(asked).skip(cap));
+        }
+        match policy.retention_hours {
+            Some(hours) => {
+                let cutoff = now_ms().saturating_sub(hours.saturating_mul(3_600_000));
+                doomed.extend(snapshots.iter().filter(|s| asked(s) && s.taken_ms < cutoff));
+                doomed.extend(snapshots.iter().filter(|s| !asked(s) && s.taken_ms < cutoff).skip(1));
+            }
+            None => {
+                let keep = config.keep.max(1);
+                doomed.extend(snapshots.iter().filter(|s| !asked(s)).skip(keep));
+                doomed.extend(snapshots.iter().filter(asked).skip(keep));
+            }
+        }
+        doomed.sort_by(|a, b| a.id.cmp(&b.id));
+        doomed.dedup_by(|a, b| a.id == b.id);
+        for old in doomed {
+            if old.kind == Kind::Scheduled {
+                for segment in self.segments(db, &old.id).await? {
+                    config.target.delete(&format!("{}{}", wal_dir(db, &old.id), segment.name)).await?;
+                }
             }
             config.target.delete(&snapshot_key(db, &old.id, old.kind)).await?;
         }

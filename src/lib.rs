@@ -32,8 +32,8 @@ pub use backup::{BackupConfig, BackupTarget, Credentials, S3Options};
 use backup::{BackupError, Backups, Kind};
 use proto::{PipelineReq, PipelineResp};
 pub use engine::Synchronous;
-pub use limits::Limits;
-use limits::{LimitsPatch, RateLimiter};
+pub use limits::{BackupPolicy, Limits};
+use limits::{BackupPolicyPatch, LimitsPatch, RateLimiter};
 pub use registry::token_generation;
 use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
@@ -56,6 +56,8 @@ pub struct Config {
     pub backup: Option<BackupConfig>,
     /// Limits for new databases; each database keeps its own copy.
     pub default_limits: Limits,
+    /// The backup policy of databases that have none of their own.
+    pub default_backup_policy: BackupPolicy,
     /// When commits reach the disk. `Full` unless chosen otherwise.
     pub synchronous: Synchronous,
 }
@@ -68,6 +70,7 @@ impl Config {
             stream_idle_timeout: Duration::from_secs(10),
             backup: None,
             default_limits: Limits::default(),
+            default_backup_policy: BackupPolicy::default(),
             synchronous: Synchronous::Full,
         }
     }
@@ -84,7 +87,7 @@ struct State {
 pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
     let state = Arc::new(State {
         secret: config.secret,
-        registry: Registry::new(config.data_dir, config.default_limits, config.synchronous),
+        registry: Registry::new(config.data_dir, config.default_limits, config.default_backup_policy, config.synchronous),
         rates: RateLimiter::default(),
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
@@ -123,6 +126,17 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
             loop {
                 tick.tick().await;
                 state.backups.run_scheduled(&state.registry).await;
+            }
+        });
+    } else if let Some(every) = state.backups.prune_every() {
+        // No schedule prunes as it goes, so backups age out on a timer.
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.backups.prune_all(&state.registry).await;
             }
         });
     }
@@ -169,6 +183,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
                     Err(err) => backup_error(err),
                 },
                 (&Method::GET, [name, "backups"]) => list_backups(&state, name).await,
+                (&Method::PATCH, [name, "backups"]) => update_backup_policy(&state, name, req).await,
                 _ => text(StatusCode::NOT_FOUND, "not found"),
             }
         }
@@ -517,9 +532,22 @@ async fn update_limits(state: &State, name: &str, req: Request<Incoming>) -> Res
 
 /// `{"backups", "point_in_time", "status"}`: see `backup::Listing`.
 async fn list_backups(state: &State, name: &str) -> Resp {
-    match state.backups.listing(name).await {
+    match state.backups.listing(&state.registry, name).await {
         Ok(listing) => json(StatusCode::OK, &listing),
         Err(err) => backup_error(err),
+    }
+}
+
+/// `{"retention_hours", "manual_every_seconds", "manual_keep"}`, each a
+/// positive number or `null`; a field left out keeps its value.
+async fn update_backup_policy(state: &State, name: &str, req: Request<Incoming>) -> Resp {
+    let patch: BackupPolicyPatch = match read_json(req).await {
+        Ok(patch) => patch,
+        Err(resp) => return resp,
+    };
+    match state.registry.set_backup_policy(name, &patch).await {
+        Ok(policy) => json(StatusCode::OK, &json!({"name": name, "policy": policy})),
+        Err(err) => registry_error(err),
     }
 }
 
@@ -620,6 +648,15 @@ fn backup_error(err: BackupError) -> Resp {
         BackupError::InvalidId => text(StatusCode::BAD_REQUEST, "backup ids are digits, or `latest`"),
         BackupError::InvalidTime => {
             text(StatusCode::BAD_REQUEST, "`at` is unix milliseconds or an RFC 3339 UTC time like 2026-10-26T09:30:00Z")
+        }
+        BackupError::TooSoon { retry_after } => {
+            let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", seconds.to_string())
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Full::new(Bytes::from(format!("a backup of this database was asked for recently; try again in {seconds} s"))))
+                .unwrap()
         }
         BackupError::Registry(err) => registry_error(err),
         BackupError::Other(err) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("backup error: {err}")),
