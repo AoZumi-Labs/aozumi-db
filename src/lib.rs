@@ -10,6 +10,7 @@ mod policy;
 mod proto;
 mod registry;
 mod stream;
+mod tls;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -40,6 +41,7 @@ use limits::{BackupPolicyPatch, LimitsPatch, RateLimiter};
 pub use registry::token_generation;
 use registry::{Registry, RegistryError};
 use stream::{Stream, Streams};
+pub use tls::Tls;
 
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Backup downloads sent at once. Each holds its whole backup in memory
@@ -66,6 +68,12 @@ pub struct Config {
     pub default_backup_policy: BackupPolicy,
     /// When commits reach the disk. `Full` unless chosen otherwise.
     pub synchronous: Synchronous,
+    /// Serve HTTPS too, on a listener of its own. `None`: the plain listener only.
+    pub tls: Option<Tls>,
+    /// Answer ACME HTTP-01 challenges (`GET /.well-known/acme-challenge/<token>`)
+    /// from `<dir>/.well-known/acme-challenge/`, where certbot's `--webroot`
+    /// writes them. `None`: that path is not found, as any other.
+    pub acme_webroot: Option<PathBuf>,
 }
 
 impl Config {
@@ -78,6 +86,8 @@ impl Config {
             default_limits: Limits::default(),
             default_backup_policy: BackupPolicy::default(),
             synchronous: Synchronous::Full,
+            tls: None,
+            acme_webroot: None,
         }
     }
 }
@@ -89,9 +99,11 @@ struct State {
     streams: Arc<Streams>,
     backups: Backups,
     downloads: Arc<tokio::sync::Semaphore>,
+    acme_webroot: Option<PathBuf>,
 }
 
-pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> {
+pub async fn serve(listener: TcpListener, mut config: Config) -> anyhow::Result<()> {
+    let tls = config.tls.take();
     let state = Arc::new(State {
         secret: config.secret,
         registry: Registry::new(config.data_dir, config.default_limits, config.default_backup_policy, config.synchronous),
@@ -99,6 +111,7 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
         streams: Streams::new(config.stream_idle_timeout),
         backups: Backups::new(config.backup),
         downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_AT_ONCE)),
+        acme_webroot: config.acme_webroot,
     });
     // Exactly one task checkpoints the WAL: the shipper when point-in-time
     // restore is on, otherwise a background checkpointer.
@@ -148,18 +161,47 @@ pub async fn serve(listener: TcpListener, config: Config) -> anyhow::Result<()> 
             }
         });
     }
+    if let Some(tls) = tls {
+        tokio::spawn(tls::serve(tls, state.clone()));
+    }
     loop {
         let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle(state, req).await) }
-            });
-            // A client that hangs up mid-request is not a server error.
-            let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
-        });
+        tokio::spawn(serve_connection(TokioIo::new(stream), state.clone(), None));
     }
+}
+
+/// How long a client may take to send what it sends, on a listener whose
+/// clients the server cannot vouch for.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// For a request's headers, and between requests on a kept-alive connection.
+    header: Duration,
+    /// For a request's body, once its headers are in.
+    body: Duration,
+}
+
+/// The time a request's body has to arrive, carried on the request.
+#[derive(Clone, Copy)]
+struct BodyTimeout(Duration);
+
+/// Serve one connection's requests, plain or TLS, within `timeouts` if given.
+async fn serve_connection<I>(io: I, state: Arc<State>, timeouts: Option<Timeouts>)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        let state = state.clone();
+        if let Some(timeouts) = timeouts {
+            req.extensions_mut().insert(BodyTimeout(timeouts.body));
+        }
+        async move { Ok::<_, Infallible>(handle(state, req).await) }
+    });
+    let mut builder = http1::Builder::new();
+    if let Some(timeouts) = timeouts {
+        builder.timer(TokioTimer::new()).header_read_timeout(timeouts.header);
+    }
+    // A client that hangs up mid-request is not a server error.
+    let _ = builder.serve_connection(io, service).await;
 }
 
 /// Every response's body: bytes in memory, boxed so a backup download can
@@ -200,6 +242,7 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match (req.method(), segments.as_slice()) {
         (&Method::GET, ["health"]) => json(StatusCode::OK, &"ok"),
+        (&Method::GET, [".well-known", "acme-challenge", token]) => acme_challenge(&state, token).await,
         (&Method::GET, ["v2"]) => json(StatusCode::OK, &json!({})),
         (&Method::POST, ["v2", "pipeline"]) => pipeline(&state, req).await,
         (&Method::POST, ["v1", "console", "run"]) => console_run(&state, req).await,
@@ -229,6 +272,25 @@ async fn handle(state: Arc<State>, req: Request<Incoming>) -> Resp {
             }
         }
         _ => text(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
+/// An ACME HTTP-01 challenge's answer, as the ACME client left it in the
+/// webroot. Tokens are base64url (RFC 8555, section 8.3), so a name with any
+/// other character never reaches the file system.
+async fn acme_challenge(state: &State, token: &str) -> Resp {
+    let Some(webroot) = &state.acme_webroot else { return text(StatusCode::NOT_FOUND, "not found") };
+    let base64url = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    if token.is_empty() || token.len() > 256 || !token.bytes().all(base64url) {
+        return text(StatusCode::NOT_FOUND, "not found");
+    }
+    match tokio::fs::read(webroot.join(".well-known").join("acme-challenge").join(token)).await {
+        Ok(answer) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body(full(answer))
+            .unwrap(),
+        Err(_) => text(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
@@ -838,11 +900,17 @@ fn unix_now() -> u64 {
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, Resp> {
-    let body = Limited::new(req.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?
-        .to_bytes();
+    let timeout = req.extensions().get::<BodyTimeout>().copied();
+    let collect = Limited::new(req.into_body(), MAX_BODY_BYTES).collect();
+    let collected = match timeout {
+        // A body that trickles in would hold its connection, and the
+        // connection's place, for as long as the client liked.
+        Some(BodyTimeout(timeout)) => tokio::time::timeout(timeout, collect)
+            .await
+            .map_err(|_| text(StatusCode::REQUEST_TIMEOUT, "the request body did not arrive in time"))?,
+        None => collect.await,
+    };
+    let body = collected.map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))?.to_bytes();
     serde_json::from_slice(&body).map_err(|err| text(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {err}")))
 }
 

@@ -191,6 +191,37 @@ backups. `--prod` runs it with production's settings instead (checked
 tokens, backups with the WAL shipped every 5 s), and `--url … --token …`
 points it at a server elsewhere.
 
+### The direct path (2026-11-04)
+
+`AOZUMI_DB_TLS_LISTEN` (DESIGN D27) lets apps in the same network skip the
+tunnel. A throwaway server built from that change ran on the same kind of
+VM as AOZUMI's (Graviton2, 2 vCPUs, Ubuntu 24.04, EBS gp3), with
+production's settings: checked tokens, the WAL shipped every 5 s, backups to
+a local directory instead of S3, and no request rate limit. It had a
+self-signed ECDSA P-256 certificate. The app side was the same Fargate
+placement as above (0.5 vCPU, Node 22), reaching the server's private
+address directly. The probe skipped certificate checks, which cost nothing
+per request on a kept-alive connection.
+
+| Per request, p50 | through the tunnel (above) | direct, 0.5 vCPU, 2 rounds | direct, 2 vCPUs |
+|---|---:|---:|---:|
+| `GET /health` | 11.33 ms | 0.53 / 0.52 ms | 0.37 ms |
+| point read | 10.90 ms | 0.67 / 0.71 ms | 0.51 ms |
+| single-row insert | 14.03 ms | 3.85 / 4.09 ms | 3.82 ms |
+| 10-row transaction | 13.85 ms | 3.90 / 4.17 ms | 3.91 ms |
+| point reads, 8 clients, 10 s | 594/s | 1,743 / 854/s | 6,802/s |
+| point read, p99 | 16.87 ms | 22.8 / 42.7 ms | 3.31 ms |
+
+- **Reads get 16 to 21 times faster, writes about 3.5 times.** What is left
+  is the server's own time plus one hop in the zone. On the throwaway's
+  loopback, a point read took 0.29 ms and an insert 3.54 ms, as on
+  production's (0.30 and 3.57 ms).
+- **TLS costs about 0.04 ms a request.** On that loopback, a point read took
+  0.329 ms over HTTPS and 0.286 ms over plain HTTP.
+- **On a 0.5-vCPU client, the tail and the 8-client rate are the client's.**
+  At 15 times the requests a second it uses up its CPU share. The same
+  probe with 2 vCPUs had a p99 of 3.3 ms and 6,802 reads a second.
+
 ## Head-to-head with libSQL's server (2026-10-26)
 
 `bench/head-to-head.sh` runs the same YCSB and open-loop client against

@@ -70,6 +70,41 @@ const db = createClient({ url: "https://db.example.com", authToken: process.env.
 | `AOZUMI_DB_MAX_SIZE_BYTES` | `0` (none) | Default size limit for new databases |
 | `AOZUMI_DB_MAX_STATEMENT_MS` | `10000` | Default statement time limit; `0` = none |
 | `AOZUMI_DB_MAX_REQUESTS_PER_SECOND` | `0` (none) | Default request rate limit |
+| `AOZUMI_DB_TLS_LISTEN` | unset | Also serve HTTPS here, such as `0.0.0.0:443`, for clients that reach the server directly. Needs the next two |
+| `AOZUMI_DB_TLS_CERT` | | PEM certificate chain, the server's own first. Read again when it changes |
+| `AOZUMI_DB_TLS_KEY` | | Its PEM private key |
+| `AOZUMI_DB_TLS_MAX_CONNECTIONS` | `2048` | HTTPS connections at once |
+| `AOZUMI_DB_TLS_MAX_CONNECTIONS_PER_ADDRESS` | `256` | HTTPS connections at once from one address |
+| `AOZUMI_DB_ACME_WEBROOT` | unset | Answer ACME HTTP-01 challenges from this directory, where `certbot --webroot` writes them |
+
+## HTTPS without a proxy
+
+The plain listener is meant for a proxy or tunnel in front of it. Clients in
+the same network can skip that hop: `AOZUMI_DB_TLS_LISTEN` serves the same API
+over HTTPS on a second address. The server reads the certificate from files
+that another program renews, and picks up a renewed pair within a second of
+the next connection, with no restart. It uses a pair only when the key matches
+the certificate, so a renewal caught halfway keeps the old pair in use.
+
+To get a certificate from Let's Encrypt with certbot, let the plain listener
+answer the challenge: whatever serves the name on port 80 (here, the proxy)
+must reach it.
+
+```bash
+AOZUMI_DB_ACME_WEBROOT=/var/lib/aozumi-db/acme   # in the server's environment
+certbot certonly --webroot -w /var/lib/aozumi-db/acme -d db.example.com \
+  --deploy-hook 'install -m 0600 -o aozumi-db "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" /etc/aozumi-db/tls/'
+AOZUMI_DB_TLS_LISTEN=0.0.0.0:443 AOZUMI_DB_TLS_CERT=/etc/aozumi-db/tls/fullchain.pem \
+  AOZUMI_DB_TLS_KEY=/etc/aozumi-db/tls/privkey.pem aozumi-db
+```
+
+The server can start before its first certificate exists: handshakes fail
+until the files hold a matching pair, while the plain listener answers the
+challenge that gets it. Every client of this listener counts against
+`AOZUMI_DB_TLS_MAX_CONNECTIONS` and its address's share, a handshake must
+finish within 10 s, a request's headers, or the next request on a
+kept-alive connection, must arrive within 30 s, and so must its body once
+the headers are in (`408` otherwise).
 
 ## Read-only tokens
 

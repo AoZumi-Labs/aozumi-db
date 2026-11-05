@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aozumi_db::{mint_token, token_generation, BackupConfig, BackupPolicy, BackupTarget, Claims, Config, Limits, Synchronous};
+use aozumi_db::{mint_token, token_generation, BackupConfig, BackupPolicy, BackupTarget, Claims, Config, Limits, Synchronous, Tls};
 
 const USAGE: &str = "usage:
   aozumi-db                         serve (configured by AOZUMI_DB_* env vars)
@@ -71,6 +71,11 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
     if config.backup.is_none() {
         eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");
     }
+    config.tls = tls_listener().await?;
+    config.acme_webroot = std::env::var("AOZUMI_DB_ACME_WEBROOT").ok().filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(webroot) = &config.acme_webroot {
+        eprintln!("aozumi-db: answering ACME challenges from {}", webroot.display());
+    }
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("aozumi-db: listening on http://{} (data in {})", listener.local_addr()?, data_dir.display());
@@ -78,6 +83,39 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
         result = aozumi_db::serve(listener, config) => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
+}
+
+/// `AOZUMI_DB_TLS_LISTEN` serves HTTPS on a second address, with the PEM files
+/// `AOZUMI_DB_TLS_CERT` (the chain) and `AOZUMI_DB_TLS_KEY`, read again when
+/// they change. `AOZUMI_DB_TLS_MAX_CONNECTIONS` and
+/// `AOZUMI_DB_TLS_MAX_CONNECTIONS_PER_ADDRESS` cap its connections.
+async fn tls_listener() -> anyhow::Result<Option<Tls>> {
+    let Some(listen) = std::env::var("AOZUMI_DB_TLS_LISTEN").ok().filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let file = |name: &str| -> anyhow::Result<PathBuf> {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("AOZUMI_DB_TLS_LISTEN is set, so {name} must name a PEM file"))
+    };
+    let (cert, key) = (file("AOZUMI_DB_TLS_CERT")?, file("AOZUMI_DB_TLS_KEY")?);
+    let count = |name: &str, default: usize| -> anyhow::Result<usize> {
+        match std::env::var(name) {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => anyhow::bail!("{name} must be a whole number above 0, got {value:?}"),
+            },
+            Err(_) => Ok(default),
+        }
+    };
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    eprintln!("aozumi-db: listening on https://{} too (certificate {})", listener.local_addr()?, cert.display());
+    let mut tls = Tls::new(listener, cert, key);
+    tls.max_connections = count("AOZUMI_DB_TLS_MAX_CONNECTIONS", tls.max_connections)?;
+    tls.max_connections_per_address = count("AOZUMI_DB_TLS_MAX_CONNECTIONS_PER_ADDRESS", tls.max_connections_per_address)?;
+    Ok(Some(tls))
 }
 
 /// `AOZUMI_DB_BACKUP_URL` turns backups on; `AOZUMI_DB_BACKUP_EVERY` (seconds,
