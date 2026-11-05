@@ -111,19 +111,16 @@ async fn an_unchanged_database_is_pruned_on_schedule_but_keeps_its_newest_backup
     server.run(Some(&app), vec![execute("CREATE TABLE t (x)")]).await;
     assert_eq!(policy(&server, "app", json!({"retention_hours": 1})).await.0, StatusCode::OK);
     // Let the schedule back it up, then stop changing it.
-    for _ in 0..100 {
-        if !kept(&server, "app").await.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.settle_backups("app").await;
     let scheduled = kept(&server, "app").await;
     let real = file_of(&cfg.dir, "app", &scheduled[0].0);
 
     let old = plant(&cfg.dir, "app", &real, 5 * HOUR_MS);
     let older = plant(&cfg.dir, "app", &real, 6 * HOUR_MS);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The next tick finds the database unchanged, then prunes; the tick
+    // after it starts once that is done.
+    let next = server.backed_up_past("app", now_ms()).await;
+    server.backed_up_past("app", next).await;
     let left = kept(&server, "app").await;
     assert!(!ids(&left).contains(&older.as_str()), "pruned without a new backup: {left:?}");
     assert!(ids(&left).contains(&old.as_str()), "the newest from before the window stays: {left:?}");
@@ -206,10 +203,11 @@ async fn backups_asked_for_do_not_split_the_point_in_time_history() {
     let server = TestServer::with_backups(&cfg).await;
     let app = server.database("app").await;
     server.run(Some(&app), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (1)")]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // WAL shipping starts its generation with a snapshot and ships the writes.
+    server.backed_up_past("app", now_ms()).await;
     let (_, manual) = snapshot(&server, "app").await;
     server.run(Some(&app), vec![execute("INSERT INTO t VALUES (2)")]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.backed_up_past("app", now_ms()).await;
 
     // The schedule's generation carries on through the asked-for backup.
     let generations = std::fs::read_dir(cfg.dir.join("app").join("wal")).unwrap().count();

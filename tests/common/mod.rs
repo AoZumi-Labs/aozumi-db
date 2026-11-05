@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aozumi_db::{BackupConfig, BackupTarget, Config};
 use bytes::Bytes;
@@ -125,6 +125,45 @@ impl TestServer {
         assert_eq!(status, StatusCode::OK, "pipeline failed: {body}");
         body["results"].as_array().unwrap().clone()
     }
+
+    /// The backup listing of `db`, polled until `done` holds, for at most 5 s.
+    pub async fn backups_until(&self, db: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let path = format!("/v1/databases/{db}/backups");
+        for _ in 0..250 {
+            let (status, body) = self.admin(Method::GET, &path, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if done(&body) {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("never true: {}", self.admin(Method::GET, &path, None).await.1);
+    }
+
+    /// Waits until every write to `db` committed before `ms` is in the backup
+    /// store, and returns the moment the store is now up to date with. Each
+    /// tick of the backup schedule, and of WAL shipping, moves that moment
+    /// on, even one that finds nothing to store.
+    pub async fn backed_up_past(&self, db: &str, ms: u64) -> u64 {
+        let up_to_date = |body: &Value| body["status"]["up_to_date_ms"].as_u64();
+        let body = self.backups_until(db, |body| up_to_date(body).is_some_and(|up| up > ms)).await;
+        up_to_date(&body).unwrap()
+    }
+
+    /// Waits until the backup schedule holds every write to `db` so far and
+    /// has ticked once more since: from then on it takes no backup until the
+    /// database changes.
+    pub async fn settle_backups(&self, db: &str) {
+        self.backed_up_past(db, now_ms()).await;
+        // A tick that looked at the database just before a write can still
+        // catch the write in its backup, and then backs the database up again
+        // on the next tick. Wait for that one.
+        self.backed_up_past(db, now_ms()).await;
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 pub fn execute(sql: &str) -> Value {
