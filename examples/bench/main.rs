@@ -4,10 +4,18 @@
 //!     cargo run --release --example bench -- latency [--rate N] [--clients N] [--seconds N]
 //!     cargo run --release --example bench -- micro [--clients N] [--seconds N]
 //!
-//! Add `--url http://host:port` to benchmark a server running elsewhere
-//! instead of one in this process: another aozumi-db, or any server that
-//! speaks libSQL's HTTP protocol (such as libSQL's own server), without
-//! auth, against an empty database.
+//! Add `--url http://host:port` (or `https://`) to benchmark a server
+//! running elsewhere instead of one in this process: another aozumi-db, or
+//! any server that speaks libSQL's HTTP protocol (such as libSQL's own
+//! server), against an empty database; add `--token <token>` when it needs
+//! one.
+//!
+//! Add `--prod` to run the in-process server as production runs it: a
+//! secret, so every request's token is checked; backups to a directory, a
+//! snapshot an hour and the WAL shipped every 5 s (the shipper is then the
+//! only checkpointer); the default limits on size and statement time. The
+//! benchmark's database is created through the admin API, without a request
+//! rate limit, and reached with a token, as an app reaches its own.
 //!
 //! The server runs in this process on its own 4-thread runtime; clients run
 //! on another 2-thread runtime over keep-alive HTTP/1.1, as `@libsql/client`
@@ -28,7 +36,7 @@ mod ycsb;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -39,7 +47,7 @@ use hyper_util::rt::TokioExecutor;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
 
-type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
+type HttpClient = Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>;
 
 struct Args {
     mode: String,
@@ -49,15 +57,43 @@ struct Args {
     seconds: u64,
     rate: u64,
     url: Option<String>,
+    token: Option<String>,
+    prod: bool,
 }
+
+/// `Bearer <token>` for every pipeline request, when the server checks tokens.
+static AUTH: OnceLock<String> = OnceLock::new();
+/// The secret of the in-process server under `--prod`.
+const PROD_SECRET: &str = "bench-secret-not-for-production-0123456789abcdef";
 
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
-    let mut parsed = Args { mode: args.next().unwrap_or_else(|| "micro".into()), workloads: vec![], records: 100_000, clients: 32, seconds: 10, rate: 1000, url: None };
+    let mut parsed = Args {
+        mode: args.next().unwrap_or_else(|| "micro".into()),
+        workloads: vec![],
+        records: 100_000,
+        clients: 32,
+        seconds: 10,
+        rate: 1000,
+        url: None,
+        token: None,
+        prod: false,
+    };
     while let Some(arg) = args.next() {
-        if arg == "--url" {
-            parsed.url = Some(args.next().expect("a URL after --url").trim_end_matches('/').to_string());
-            continue;
+        match arg.as_str() {
+            "--url" => {
+                parsed.url = Some(args.next().expect("a URL after --url").trim_end_matches('/').to_string());
+                continue;
+            }
+            "--token" => {
+                parsed.token = Some(args.next().expect("a token after --token"));
+                continue;
+            }
+            "--prod" => {
+                parsed.prod = true;
+                continue;
+            }
+            _ => {}
         }
         let mut value = || args.next().and_then(|v| v.parse().ok()).expect("a number after the flag");
         match arg.as_str() {
@@ -78,20 +114,42 @@ fn main() {
     let args = parse_args();
     let dir = tempfile::tempdir().unwrap();
     let server = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    // The database's file in the in-process server's data directory.
+    let database = if args.prod { "bench" } else { "default" };
     let url = match &args.url {
-        Some(url) => format!("{url}/v2/pipeline"),
+        Some(url) => {
+            if let Some(token) = &args.token {
+                AUTH.set(format!("Bearer {token}")).unwrap();
+            }
+            println!("server: {url}");
+            format!("{url}/v2/pipeline")
+        }
         None => {
-            let addr = server.block_on(async {
+            let prod = args.prod;
+            let data = dir.path().to_path_buf();
+            let addr = server.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-                let config = aozumi_db::Config::new(dir.path().to_path_buf(), None);
+                let config = match prod {
+                    false => aozumi_db::Config::new(data.join("data"), None),
+                    true => production_config(&data),
+                };
                 tokio::spawn(async move { aozumi_db::serve(listener, config).await.unwrap() });
                 addr
             });
+            match args.prod {
+                false => println!("server: in this process, dev mode (no token check, no backups)"),
+                true => {
+                    let token = server.block_on(bench_database(addr));
+                    AUTH.set(format!("Bearer {token}")).unwrap();
+                    println!("server: in this process, as production runs it (tokens checked, backups with the WAL shipped every 5 s)");
+                }
+            }
             format!("http://{addr}/v2/pipeline")
         }
     };
     let local = args.url.is_none();
+    let data = dir.path().join("data");
     let clients = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let duration = Duration::from_secs(args.seconds);
     let machine = format!("{} cores", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
@@ -121,17 +179,49 @@ fn main() {
             assert!(send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await);
             open_loop(&url, args.clients, args.rate, duration).await;
             if local {
-                let wal = std::fs::metadata(dir.path().join("default.db-wal")).map(|m| m.len()).unwrap_or(0);
+                let wal = std::fs::metadata(data.join(format!("{database}.db-wal"))).map(|m| m.len()).unwrap_or(0);
                 println!("\nWAL at the end: {:.1} MB", wal as f64 / 1e6);
             }
         }),
         _ => {
             clients.block_on(micro(&url, args.clients, duration));
             if local {
-                engine_baseline(dir.path(), duration);
+                engine_baseline(&data.join(format!("{database}.db")), duration);
             }
         }
     }
+}
+
+/// The in-process server with production's settings (hosting/install.sh in
+/// AOZUMI's hosting): checked tokens, backups with the WAL shipped every
+/// 5 s, and the default size and statement limits.
+fn production_config(dir: &std::path::Path) -> aozumi_db::Config {
+    let mut config = aozumi_db::Config::new(dir.join("data"), Some(PROD_SECRET.as_bytes().to_vec()));
+    config.backup = Some(aozumi_db::BackupConfig {
+        target: aozumi_db::BackupTarget::directory(dir.join("backups")),
+        keep: 48,
+        every: Some(Duration::from_secs(3600)),
+        wal_every: Some(Duration::from_secs(5)),
+        prune_every: Duration::from_secs(300),
+    });
+    config.default_limits = aozumi_db::Limits { max_size_bytes: Some(268_435_456), max_statement_ms: Some(5000), max_requests_per_second: None };
+    config
+}
+
+/// Create the benchmark's database through the admin API and mint its token.
+async fn bench_database(addr: std::net::SocketAddr) -> String {
+    let client = new_client();
+    let admin = |path: &str, body: Value| {
+        Request::post(format!("http://{addr}{path}"))
+            .header("authorization", format!("Bearer {PROD_SECRET}"))
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap()
+    };
+    let created = client.request(admin("/v1/databases", json!({"name": "bench"}))).await.unwrap();
+    assert!(created.status().is_success(), "creating the benchmark's database: HTTP {}", created.status());
+    let minted = client.request(admin("/v1/databases/bench/tokens", json!({}))).await.unwrap();
+    let body: Value = serde_json::from_slice(&minted.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["token"].as_str().expect("a token").to_string()
 }
 
 pub fn int(n: u64) -> Value {
@@ -161,8 +251,10 @@ fn failed_cell(failed: u64, succeeded: usize) -> String {
     }
 }
 
+/// Plain HTTP, or HTTPS checked against the web PKI's roots for `--url https://…`.
 fn new_client() -> HttpClient {
-    Client::builder(TokioExecutor::new()).pool_max_idle_per_host(1).build_http()
+    let connector = hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots().https_or_http().enable_http1().build();
+    Client::builder(TokioExecutor::new()).pool_max_idle_per_host(1).build(connector)
 }
 
 /// A request with no answer by then counts as failed, so a server that
@@ -177,7 +269,11 @@ static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
 async fn send(client: &HttpClient, url: &str, mut requests: Vec<Value>) -> bool {
     requests.push(json!({"type": "close"}));
     let body = json!({"baton": null, "requests": requests}).to_string();
-    let request = Request::post(url).body(Full::new(Bytes::from(body))).unwrap();
+    let mut request = Request::post(url);
+    if let Some(auth) = AUTH.get() {
+        request = request.header("authorization", auth);
+    }
+    let request = request.body(Full::new(Bytes::from(body))).unwrap();
     let exchange = async {
         let response = client.request(request).await.unwrap();
         let status = response.status();
@@ -379,10 +475,10 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// The same point reads straight on the engine, one thread, no server.
-fn engine_baseline(dir: &std::path::Path, duration: Duration) {
+fn engine_baseline(file: &std::path::Path, duration: Duration) {
     use turso_core::{Database, SqliteDialect, Value as Core};
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db = Database::open_file(io, dir.join("default.db").to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, file.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
     let started = Instant::now();
     let mut n = 0u64;
