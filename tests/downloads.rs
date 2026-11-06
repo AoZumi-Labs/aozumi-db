@@ -69,7 +69,8 @@ async fn a_backup_downloads_as_a_database_file() {
         assert_eq!(status, StatusCode::OK, "{which}");
         assert_eq!(headers["content-type"], "application/vnd.sqlite3");
         assert_eq!(headers["content-disposition"], format!("attachment; filename=\"app-{id}.db\""));
-        assert_eq!(bytes.len() as u64, backup["size_bytes"].as_u64().unwrap());
+        // `size_bytes` is what the backup takes in the store, compressed; the download is the file itself.
+        assert!(bytes.len() as u64 > backup["size_bytes"].as_u64().unwrap() && bytes.len() % 4096 == 0, "{} bytes", bytes.len());
         assert!(bytes.starts_with(b"SQLite format 3\0"), "a database file");
         assert!(bytes.windows(4).any(|w| w == b"kept"), "with the data in it");
     }
@@ -99,7 +100,7 @@ async fn deleting_with_its_backups_removes_every_backup_and_wal_segment() {
         }
         snapshot(&server, name).await;
     }
-    assert!(files(&cfg.dir.join("app")).iter().any(|f| f.ends_with(".wal")), "WAL was shipped: {:?}", files(&cfg.dir.join("app")));
+    assert!(files(&cfg.dir.join("app")).iter().any(|f| f.ends_with(".wal.zst")), "WAL was shipped: {:?}", files(&cfg.dir.join("app")));
 
     let (status, body) = server.admin(Method::DELETE, "/v1/databases/app?backups=delete", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");

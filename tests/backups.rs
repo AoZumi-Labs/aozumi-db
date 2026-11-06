@@ -344,12 +344,13 @@ async fn scheduled_backups_skip_unchanged_databases_and_keep_the_newest() {
 }
 
 /// A database of one 64 MB row, backed up: writing and checking a copy of
-/// it takes a while.
+/// it takes a while. Its zeros compress to almost nothing in the store, but a
+/// restore still writes and checks all 64 MB.
 async fn large_backup(server: &TestServer, db: &str) {
     let token = server.database(db).await;
     server.run(Some(&token), vec![execute("CREATE TABLE t (x)"), execute("INSERT INTO t VALUES (zeroblob(64000000))")]).await;
     let backup = snapshot(server, db).await;
-    assert!(backup["size_bytes"].as_u64().unwrap() > 60_000_000, "{backup}");
+    assert!(backup["size_bytes"].as_u64().unwrap() < 1_000_000, "stored compressed: {backup}");
 }
 
 /// Files in the data directory, at any depth, that are none of these

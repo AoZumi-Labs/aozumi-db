@@ -222,7 +222,7 @@ async fn backups_go_to_s3_and_restore_from_it() {
 
     let keys = fake.lock().unwrap().objects.keys().cloned().collect::<Vec<_>>();
     assert_eq!(keys.len(), 2, "retention deletes the oldest from the bucket: {keys:?}");
-    assert!(keys.iter().all(|k| k.starts_with("team/prod/app/") && k.ends_with(".db")), "{keys:?}");
+    assert!(keys.iter().all(|k| k.starts_with("team/prod/app/") && k.ends_with(".db.zst")), "{keys:?}");
 
     let (_, listed) = server.admin(Method::GET, "/v1/databases/app/backups", None).await;
     assert_eq!(listed["backups"].as_array().unwrap().len(), 2, "{listed}");
@@ -368,7 +368,7 @@ async fn deleting_with_backups_lists_them_before_the_name_is_free() {
     server.database("app").await;
     let (status, old) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
     assert_eq!(status, StatusCode::CREATED, "{old}");
-    let old_key = format!("team/prod/app/{}.manual.db", old["id"].as_str().unwrap());
+    let old_key = format!("team/prod/app/{}.manual.db.zst", old["id"].as_str().unwrap());
     assert!(fake.lock().unwrap().objects.contains_key(&old_key));
 
     // Listing the database's backups waits at a gate, and meanwhile the name is asked for again.
@@ -389,7 +389,7 @@ async fn deleting_with_backups_lists_them_before_the_name_is_free() {
     server.database("app").await;
     let (status, new) = server.admin(Method::POST, "/v1/databases/app/backups", None).await;
     assert_eq!(status, StatusCode::CREATED, "{new}");
-    let new_key = format!("team/prod/app/{}.manual.db", new["id"].as_str().unwrap());
+    let new_key = format!("team/prod/app/{}.manual.db.zst", new["id"].as_str().unwrap());
     for _ in 0..250 {
         if !fake.lock().unwrap().objects.contains_key(&old_key) {
             break;
