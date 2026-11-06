@@ -28,6 +28,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # The storage engine's core API, pinned exactly: we drive its WAL directly.
 turso_core = { version = "=0.8.3", features = ["conn_raw_api"] }
 turso_parser = "=0.8.3"
+# Backups are stored compressed: WAL frames repeat the same pages, and squeeze ~100x.
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 # Certificates for the TLS listener's tests.

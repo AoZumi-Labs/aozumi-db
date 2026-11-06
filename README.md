@@ -267,8 +267,13 @@ curl localhost:8080/v1/databases/notes/backups -H "authorization: Bearer $AOZUMI
 - `kind` is `scheduled` (taken by the server: its schedule, or WAL shipping
   starting a new generation), `manual` (asked for with `POST .../backups`) or
   `before_restore`. It is part of the backup's name in the store
-  (`<id>.db`, `<id>.manual.db`, `<id>.before-restore.db`); older servers skip
-  names they do not know and never delete them.
+  (`<id>.db.zst`, `<id>.manual.db.zst`, `<id>.before-restore.db.zst`); older
+  servers skip names they do not know and never delete them.
+- `size_bytes` is what the backup takes in the store. Snapshots and WAL
+  segments are stored compressed with zstd (`.zst`): WAL segments come out
+  about 90 times smaller, snapshots about 4 times. A download is the database
+  file itself, decompressed. Backups that earlier servers stored plain are
+  read as they are.
 - `last_backup_ms` is the newest snapshot or WAL segment in the store.
 - `up_to_date_ms` is the last moment the server saw every committed write
   in the store. It is kept in memory, so it is `null` after a restart until

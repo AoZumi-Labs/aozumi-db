@@ -46,7 +46,9 @@ async fn kept(server: &TestServer, db: &str) -> Vec<(String, String)> {
 /// it `ago_ms` ago.
 fn plant(store: &Path, db: &str, from: &Path, ago_ms: u64) -> String {
     let id = format!("{:013}", now_ms() - ago_ms);
-    std::fs::copy(from, store.join(db).join(format!("{id}.db"))).unwrap();
+    // Stored as the copy is: compressed (`.db.zst`), as this server stores backups.
+    let suffix = if from.extension().is_some_and(|e| e == "zst") { ".db.zst" } else { ".db" };
+    std::fs::copy(from, store.join(db).join(format!("{id}{suffix}"))).unwrap();
     id
 }
 
