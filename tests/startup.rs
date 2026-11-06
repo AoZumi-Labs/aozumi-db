@@ -93,3 +93,36 @@ fn a_secret_starts_the_server_with_auth() {
     let printed = listening(&[("AOZUMI_DB_SECRET", "startup-test-secret")]);
     assert!(!printed.contains("dev mode"), "{printed}");
 }
+
+/// Runs a one-off command of the binary and returns its exit code, stdout and stderr.
+fn command(args: &[&str]) -> (i32, String, String) {
+    let data = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_aozumi-db"))
+        .env_clear()
+        .env("AOZUMI_DB_SECRET", "startup-test-secret")
+        .env("AOZUMI_DB_DATA_DIR", data.path())
+        .args(args)
+        .output()
+        .unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
+}
+
+#[test]
+fn help_prints_the_usage_and_succeeds() {
+    for flag in ["--help", "-h", "help"] {
+        let (code, stdout, _) = command(&[flag]);
+        assert_eq!(code, 0, "{flag}");
+        assert!(stdout.contains("aozumi-db token <database>"), "{flag}: {stdout}");
+    }
+    assert_eq!(command(&["nonsense"]).0, 2);
+}
+
+#[test]
+fn a_bad_ttl_is_explained_and_a_huge_one_does_not_overflow() {
+    let (code, _, stderr) = command(&["token", "notes", "1h"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("ttl must be a whole number of seconds") && stderr.contains("\"1h\""), "{stderr}");
+    let (code, stdout, stderr) = command(&["token", "notes", &u64::MAX.to_string()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.starts_with("adb1."), "{stdout}");
+}

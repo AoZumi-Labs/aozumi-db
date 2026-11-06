@@ -22,10 +22,17 @@ async fn main() -> anyhow::Result<()> {
 
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => serve(secret).await,
+        ["-h" | "--help" | "help"] => {
+            println!("{USAGE}");
+            Ok(())
+        }
         ["token", db, rest @ ..] if rest.len() <= 1 => {
             let secret = secret.ok_or_else(|| anyhow::anyhow!("set AOZUMI_DB_SECRET to mint tokens"))?;
             let exp = match rest.first() {
-                Some(ttl) => Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + ttl.parse::<u64>()?),
+                Some(ttl) => {
+                    let ttl = ttl.parse::<u64>().map_err(|_| anyhow::anyhow!("ttl must be a whole number of seconds, got {ttl:?}"))?;
+                    Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_add(ttl))
+                }
                 None => None,
             };
             // The server's own record of the generation, so the token is not one it already revoked.
