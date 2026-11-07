@@ -88,6 +88,24 @@ impl Stream {
         outcomes
     }
 
+    /// Runs a console script as a dry run: inside one transaction that is
+    /// always rolled back, so each statement reports what it would change
+    /// and nothing is kept. The caller refuses scripts that control
+    /// transactions (`console::not_dry_runnable`). If the transaction cannot
+    /// start, nothing runs.
+    pub fn run_console_dry(&mut self, split: console::Split) -> Result<Vec<console::Outcome>, Error> {
+        self.dirty |= split.texts().any(changes_connection);
+        self.closed = true;
+        self.conn.execute_script("BEGIN")?;
+        let outcomes = console::run(&self.conn, split);
+        // A failed rollback leaves the transaction open, and `release` then
+        // drops the connection: nothing it did is committed either way.
+        if !self.conn.autocommit() {
+            let _ = self.conn.execute_script("ROLLBACK");
+        }
+        Ok(outcomes)
+    }
+
     /// Inside a transaction, the stream may hold the engine's write lock
     /// across requests, so it must not queue behind writers waiting for it.
     pub fn in_transaction(&self) -> bool {

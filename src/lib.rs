@@ -74,7 +74,13 @@ pub struct Config {
     /// from `<dir>/.well-known/acme-challenge/`, where certbot's `--webroot`
     /// writes them. `None`: that path is not found, as any other.
     pub acme_webroot: Option<PathBuf>,
+    /// How often databases created with an expiry (branches) are checked and
+    /// the expired ones deleted, with their backups.
+    pub expiry_every: Duration,
 }
+
+/// Longest expiry a database may be created with: a year.
+const MAX_EXPIRES_IN_SECONDS: u64 = 365 * 24 * 3600;
 
 impl Config {
     pub fn new(data_dir: PathBuf, secret: Option<Vec<u8>>) -> Self {
@@ -88,6 +94,7 @@ impl Config {
             synchronous: Synchronous::Full,
             tls: None,
             acme_webroot: None,
+            expiry_every: Duration::from_secs(30),
         }
     }
 }
@@ -158,6 +165,18 @@ pub async fn serve(listener: TcpListener, mut config: Config) -> anyhow::Result<
             loop {
                 tick.tick().await;
                 state.backups.prune_all(&state.registry).await;
+            }
+        });
+    }
+    {
+        // Databases created with an expiry, such as branches, go away on their own.
+        let (state, every) = (state.clone(), config.expiry_every);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                delete_expired(&state).await;
             }
         });
     }
@@ -424,6 +443,10 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
         sql: String,
         #[serde(default)]
         confirm_destructive: bool,
+        /// Run inside a transaction that is rolled back: see what the script
+        /// would change without keeping any of it.
+        #[serde(default)]
+        dry_run: bool,
     }
     let (database, read_only, db) = match token_database(state, &req).await {
         Ok(found) => found,
@@ -443,7 +466,17 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     if split.len() > console::MAX_STATEMENTS {
         return console_error(StatusCode::BAD_REQUEST, &format!("Run at most {} statements at a time.", console::MAX_STATEMENTS), "too_many_statements");
     }
-    if !read_only && !body.confirm_destructive {
+    if body.dry_run {
+        let refused = console::not_dry_runnable(&split);
+        if !refused.is_empty() {
+            return json(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "This script cannot run as a dry run.", "code": "dry_run_unsupported", "statements": refused}),
+            );
+        }
+    }
+    // A dry run keeps nothing, so it needs no confirmation.
+    if !read_only && !body.confirm_destructive && !body.dry_run {
         let destructive = console::destructive(&split);
         if !destructive.is_empty() {
             return json(
@@ -467,8 +500,12 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
         true => None,
     };
     let started = Instant::now();
+    let dry_run = body.dry_run;
     let (stream, statements) = match tokio::task::spawn_blocking(move || {
-        let statements = stream.run_console(split);
+        let statements = match dry_run {
+            true => stream.run_console_dry(split),
+            false => Ok(stream.run_console(split)),
+        };
         (stream, statements)
     })
     .await
@@ -478,8 +515,12 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     };
     drop(turn);
     stream.release();
+    let statements = match statements {
+        Ok(statements) => statements,
+        Err(err) => return console_error(StatusCode::INTERNAL_SERVER_ERROR, &err.message, "dry_run_failed"),
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
-    json(StatusCode::OK, &console::RunResult { read_only, duration_ms, statements })
+    json(StatusCode::OK, &console::RunResult { read_only, dry_run, duration_ms, statements })
 }
 
 /// The console's schema: `{"tables": [{"name", "columns": [...]}]}`.
@@ -488,6 +529,13 @@ async fn console_schema(state: &State, req: Request<Incoming>) -> Resp {
         Ok(found) => found,
         Err(resp) => return resp,
     };
+    // `?format=sql`: the schema as compact SQL with row counts, for agents.
+    if req.uri().query() == Some("format=sql") {
+        return match console_read(db, console::compact_schema).await {
+            Ok(sql) => json(StatusCode::OK, &json!({"sql": sql})),
+            Err(resp) => resp,
+        };
+    }
     match console_read(db, console::schema).await {
         Ok(tables) => json(StatusCode::OK, &json!({"tables": tables})),
         Err(resp) => resp,
@@ -594,8 +642,14 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
         name: String,
         /// Start from a backup instead of empty.
         restore: Option<Restore>,
-        /// Changes to the server's default limits for this database.
+        /// Changes to the server's default limits for this database. A branch
+        /// starts from its source's limits instead, and this changes those.
         limits: Option<LimitsPatch>,
+        /// Start from a consistent copy of this database as it is now (a
+        /// branch): no backup needed, and the source is not changed.
+        branch_of: Option<String>,
+        /// Delete the database (and its backups) this many seconds from now.
+        expires_in_seconds: Option<u64>,
     }
     #[derive(Deserialize)]
     struct Restore {
@@ -609,14 +663,53 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
         Ok(body) => body,
         Err(resp) => return resp,
     };
+    if body.restore.is_some() && body.branch_of.is_some() {
+        return text(StatusCode::BAD_REQUEST, "a database starts from `restore` or `branch_of`, not both");
+    }
+    if let Some(seconds) = body.expires_in_seconds {
+        if seconds == 0 || seconds > MAX_EXPIRES_IN_SECONDS {
+            return text(StatusCode::BAD_REQUEST, &format!("`expires_in_seconds` is between 1 and {MAX_EXPIRES_IN_SECONDS}"));
+        }
+    }
     let limits = match state.registry.limits_for_new(body.limits.as_ref()) {
         Ok(limits) => limits,
         Err(err) => return registry_error(err),
     };
     let mut restored_to_ms = None;
-    let created = match body.restore {
-        None => state.registry.create(&body.name, limits).await,
-        Some(from) => {
+    let mut branched_at_ms = None;
+    let created = match (body.restore, &body.branch_of) {
+        (None, None) => state.registry.create(&body.name, limits).await,
+        (None, Some(source)) => {
+            match state.registry.open(&body.name, false).await {
+                Ok(_) => return registry_error(RegistryError::Exists),
+                Err(RegistryError::NotFound) => {}
+                Err(err) => return registry_error(err),
+            }
+            let source_db = match state.registry.open(source, false).await {
+                Ok(db) => db,
+                Err(RegistryError::NotFound) => return text(StatusCode::NOT_FOUND, &format!("no database named {source} to branch from")),
+                Err(err) => return registry_error(err),
+            };
+            let limits = match &body.limits {
+                Some(patch) => match source_db.limits.apply(patch) {
+                    Ok(limits) => limits,
+                    Err(err) => return registry_error(RegistryError::InvalidLimits(err)),
+                },
+                None => source_db.limits,
+            };
+            drop(source_db);
+            // The same consistent copy a backup takes: writers to the source
+            // wait for a local file copy, readers never do.
+            let taken = now_ms();
+            match state.registry.snapshot(source).await {
+                Ok(snapshot) => {
+                    branched_at_ms = Some(taken);
+                    state.registry.create_from(&body.name, snapshot.bytes, limits).await
+                }
+                Err(err) => Err(err),
+            }
+        }
+        (Some(from), _) => {
             // Refuse early so a doomed restore does not download a backup.
             match state.registry.open(&body.name, false).await {
                 Ok(_) => return registry_error(RegistryError::Exists),
@@ -640,12 +733,40 @@ async fn create_database(state: &State, req: Request<Incoming>) -> Resp {
             }
         }
     };
-    match created {
-        Ok(()) => match restored_to_ms {
-            Some(ms) => json(StatusCode::CREATED, &json!({"name": body.name, "restored_to_ms": ms})),
-            None => json(StatusCode::CREATED, &json!({"name": body.name})),
-        },
-        Err(err) => registry_error(err),
+    if let Err(err) = created {
+        return registry_error(err);
+    }
+    let mut answer = json!({"name": body.name});
+    if let Some(ms) = restored_to_ms {
+        answer["restored_to_ms"] = json!(ms);
+    }
+    if let (Some(source), Some(ms)) = (&body.branch_of, branched_at_ms) {
+        answer["branch_of"] = json!(source);
+        answer["branched_at_ms"] = json!(ms);
+    }
+    if let Some(seconds) = body.expires_in_seconds {
+        let expires_ms = now_ms().saturating_add(seconds.saturating_mul(1000));
+        if let Err(err) = state.registry.set_expiry(&body.name, expires_ms).await {
+            // Without its expiry the database would live forever: do not keep it.
+            let _ = state.registry.delete(&body.name).await;
+            return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not record the expiry: {err}"));
+        }
+        answer["expires_ms"] = json!(expires_ms);
+    }
+    json(StatusCode::CREATED, &answer)
+}
+
+/// Deletes the databases whose expiry has passed, with their backups, as
+/// `DELETE /v1/databases/{name}?backups=delete` would.
+async fn delete_expired(state: &Arc<State>) {
+    let Ok(names) = state.registry.list().await else { return };
+    let now = now_ms();
+    for name in names {
+        if let Ok(Some(expires_ms)) = state.registry.expiry(&name).await {
+            if expires_ms <= now {
+                let _ = delete_database(state, &name, Some("backups=delete")).await;
+            }
+        }
     }
 }
 
@@ -657,7 +778,8 @@ async fn database_info(state: &State, name: &str) -> Resp {
     match state.registry.size(name).await {
         Ok(size_bytes) => json(
             StatusCode::OK,
-            &json!({"name": name, "size_bytes": size_bytes, "limits": db.limits, "token_generation": db.token_generation}),
+            &json!({"name": name, "size_bytes": size_bytes, "limits": db.limits, "token_generation": db.token_generation,
+                "expires_ms": state.registry.expiry(name).await.ok().flatten()}),
         ),
         Err(err) => registry_error(err),
     }
@@ -966,4 +1088,8 @@ fn text(status: StatusCode, body: &str) -> Resp {
         .header("content-type", "text/plain; charset=utf-8")
         .body(full(body.to_string()))
         .unwrap()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

@@ -529,6 +529,28 @@ impl Registry {
         Ok(names)
     }
 
+    fn expiry_path(&self, name: &str) -> PathBuf {
+        // `<name>.db-…`: deleting the database removes it with the other side files.
+        self.dir.join(format!("{name}.db-expires"))
+    }
+
+    /// Record when a database expires (unix ms). The reaper deletes it then.
+    pub async fn set_expiry(&self, name: &str, expires_ms: u64) -> anyhow::Result<()> {
+        let partial = self.dir.join(format!(".{name}.expires"));
+        tokio::fs::write(&partial, expires_ms.to_string()).await?;
+        tokio::fs::rename(&partial, self.expiry_path(name)).await?;
+        Ok(())
+    }
+
+    /// When a database expires, if it was created with an expiry.
+    pub async fn expiry(&self, name: &str) -> anyhow::Result<Option<u64>> {
+        match tokio::fs::read_to_string(self.expiry_path(name)).await {
+            Ok(text) => Ok(Some(text.trim().parse()?)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// A consistent copy of a database as one file. Writers wait (they do
     /// not fail) while the files are copied; readers carry on.
     pub async fn snapshot(&self, name: &str) -> Result<Snapshot, RegistryError> {
