@@ -37,6 +37,8 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 # Reading raw sockets in the TLS listener's tests.
 tokio = { version = "1", features = ["io-util"] }
 tempfile = "3"
+# The benchmark's embedded baseline: the same YCSB workloads on SQLite's C library (examples/bench/embedded.rs).
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.dev]
 # The engine is large; skipping debug info keeps target/ small on a nearly full disk.

@@ -321,8 +321,8 @@ asked for never cuts the point-in-time history.
 | `GET` | `/v2` | none | protocol version check |
 | `GET` | `/health` | none | liveness |
 | `GET` | `/v1/databases` | admin | list databases |
-| `POST` | `/v1/databases` | admin | create `{"name"}`, optionally `"limits"` and `"restore": {"database", "backup" or "at"}` |
-| `GET` | `/v1/databases/{name}` | admin | size, limits and token generation |
+| `POST` | `/v1/databases` | admin | create `{"name"}`, optionally `"limits"`, `"restore": {"database", "backup" or "at"}` or `"branch_of": "<database>"` (a copy of it as it is now), and `"expires_in_seconds"` |
+| `GET` | `/v1/databases/{name}` | admin | size, limits, token generation and `expires_ms` (null without an expiry) |
 | `PATCH` | `/v1/databases/{name}/limits` | admin | change limits |
 | `DELETE` | `/v1/databases/{name}` | admin | delete a database and its files; `?backups=delete` deletes its backups too |
 | `POST` | `/v1/databases/{name}/tokens` | admin | `{"ttl_seconds": N, "read_only": bool}` → `{"token": "..."}` at the current token generation |
@@ -332,8 +332,8 @@ asked for never cuts the point-in-time history.
 | `PATCH` | `/v1/databases/{name}/backups` | admin | change the backup policy: `{"retention_hours", "manual_every_seconds", "manual_keep"}` |
 | `POST` | `/v1/databases/{name}/restore` | admin | restore in place from `{"backup"}` or `{"at"}` → `{"name", "restored_to_ms", "before_restore"}` |
 | `GET` | `/v1/databases/{name}/backups/{id}` | admin | a backup (`latest` or an id) as a database file, `application/vnd.sqlite3` |
-| `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?}`: run a script statement by statement for the AOZUMI DB console |
-| `GET` | `/v1/console/schema` | database token | the database's tables and their columns |
+| `POST` | `/v1/console/run` | database token | `{"sql", "confirm_destructive"?, "dry_run"?}`: run a script statement by statement for the AOZUMI DB console |
+| `GET` | `/v1/console/schema` | database token | the database's tables and their columns; `?format=sql` gives `{"sql"}`, each table's `CREATE` statement with its row count, then its indexes, views and triggers |
 | `POST` | `/v1/console/rows` | database token | `{"table", "page"}`: 50 rows of a table and its row count |
 
 The console endpoints are for people reading results, not for apps: a script
@@ -344,6 +344,27 @@ them all. A read-only token reads only, as everywhere. With a read-write
 token, a script that drops a table, index, view, trigger or column, or deletes
 or updates every row of a table, answers 409 `confirm_destructive` with what it
 would destroy, and runs only when sent again with `"confirm_destructive": true`.
+
+With `"dry_run": true`, the script runs inside a transaction that is always
+rolled back: each statement reports what it would have changed
+(`rowsAffected`) and later statements see earlier ones, but nothing is kept,
+so a dry run needs no `confirm_destructive`. The response carries
+`"dryRun": true`. Statements that would end that transaction or escape it
+(`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `VACUUM`, and pragmas
+that set a value) answer 400 `dry_run_unsupported`.
+
+### Branches and expiry
+
+`POST /v1/databases {"name": "app-try", "branch_of": "app"}` makes `app-try`
+from a consistent copy of `app` as it is at that moment, the copy a backup
+takes: writers to `app` wait for a local file copy, readers never do, and no
+backup store is needed. The branch keeps `app`'s limits (a `limits` patch
+changes them) and from then on the two are independent. The answer names
+`branch_of` and `branched_at_ms`.
+
+Any new database, branch or not, may get `"expires_in_seconds"` (at most a
+year): the server deletes it and its backups once that passes, checking every
+30 seconds.
 
 Supported pipeline requests: `execute`, `batch` (with conditions), `sequence`,
 `store_sql`, `close_sql`, `get_autocommit`, `close`. Interactive

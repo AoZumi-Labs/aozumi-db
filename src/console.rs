@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 use turso_core::{Dialect, Numeric, SqliteDialect, Value as Core};
-use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
+use turso_parser::ast::{AlterTableBody, Cmd, PragmaBody, Stmt};
 use turso_parser::lexer::Lexer;
 use turso_parser::parser::Parser;
 use turso_parser::token::TokenType;
@@ -110,6 +110,10 @@ impl Outcome {
 #[serde(rename_all = "camelCase")]
 pub struct RunResult {
     pub read_only: bool,
+    /// The script ran inside a transaction that was rolled back: nothing it
+    /// did was kept, and `rowsAffected` says what it would have changed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     pub duration_ms: u64,
     pub statements: Vec<Outcome>,
 }
@@ -248,6 +252,32 @@ pub fn destructive(split: &Split) -> Vec<Destructive> {
         .collect()
 }
 
+/// The statements of a script a dry run refuses, and why. A dry run is one
+/// transaction that is always rolled back, so a statement that ends it
+/// (`COMMIT`, `ROLLBACK`, `RELEASE`) or starts another would let what came
+/// before it be kept; `VACUUM` cannot run inside a transaction; and a pragma
+/// that sets a value may change the connection or the file beyond the
+/// transaction. Reading pragmas (`PRAGMA table_info(t)`) are fine. Read from
+/// the parse, like `destructive`.
+pub fn not_dry_runnable(split: &Split) -> Vec<Destructive> {
+    split
+        .statements
+        .iter()
+        .filter_map(|sql| {
+            let Some(Ok(Cmd::Stmt(stmt))) = Parser::new(sql.as_bytes()).next() else { return None };
+            let what = match &stmt {
+                Stmt::Begin { .. } | Stmt::Commit { .. } | Stmt::Rollback { .. } | Stmt::Savepoint { .. } | Stmt::Release { .. } => {
+                    "controls a transaction, and a dry run is one transaction that is rolled back"
+                }
+                Stmt::Vacuum { .. } => "cannot run inside a transaction",
+                Stmt::Pragma { body: Some(PragmaBody::Equals(_)), .. } => "sets a pragma, which can outlast the dry run",
+                _ => return None,
+            };
+            Some(Destructive { sql: sql.clone(), what: what.to_string() })
+        })
+        .collect()
+}
+
 /// Runs a script's statements in order on `conn`; the first error stops the
 /// rest. The caller rolls back a transaction the script left open.
 pub fn run(conn: &Conn, split: Split) -> Vec<Outcome> {
@@ -379,6 +409,52 @@ pub fn schema(conn: &Conn) -> Result<Vec<TableSchema>, Error> {
             Ok(TableSchema { name, columns })
         })
         .collect()
+}
+
+/// Row counts in the compact schema stop at this many, so describing a large
+/// table stays cheap; a table with more shows `100000+`.
+pub const COMPACT_COUNT_CAP: u64 = 100_000;
+
+/// The schema as SQL, for a reader with little room, such as an agent's
+/// context: each table's `CREATE` statement with its row count, followed by
+/// the indexes, views and triggers on it, in SQLite's own text. About a
+/// tenth of the JSON schema's size, and it also carries defaults,
+/// constraints, foreign keys and indexes. Only the tables the database lists
+/// (as `schema` does), and at most MAX_SCHEMA_TABLES of them.
+pub fn compact_schema(conn: &Conn) -> Result<String, Error> {
+    let listed: Vec<String> = tables(conn)?.into_iter().take(MAX_SCHEMA_TABLES).collect();
+    let mut objects: Vec<(String, String, String, String)> = Vec::new();
+    conn.execute_each(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY tbl_name, type <> 'table', type, name",
+        |values| {
+            let text = |i: usize| values.get(i).and_then(|value| value.to_text()).unwrap_or_default().to_string();
+            objects.push((text(0), text(1), text(2), text(3)));
+        },
+    )?;
+    let mut out = String::new();
+    for table in &listed {
+        for (kind, _, _, sql) in objects.iter().filter(|(_, _, on, _)| on == table) {
+            out.push_str(sql.trim_end_matches(';'));
+            out.push(';');
+            if kind == "table" {
+                let mut count = 0u64;
+                conn.execute_each(
+                    &format!("SELECT count(*) FROM (SELECT 1 FROM {} LIMIT {})", quote_identifier(table), COMPACT_COUNT_CAP + 1),
+                    |values| {
+                        if let Some(Core::Numeric(Numeric::Integer(n))) = values.first() {
+                            count = u64::try_from(*n).unwrap_or(0);
+                        }
+                    },
+                )?;
+                match count > COMPACT_COUNT_CAP {
+                    true => out.push_str(&format!(" -- {COMPACT_COUNT_CAP}+ rows")),
+                    false => out.push_str(&format!(" -- {count} row{}", if count == 1 { "" } else { "s" })),
+                }
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 /// A table name the browser may ask for: 1 to 256 characters, no control characters.

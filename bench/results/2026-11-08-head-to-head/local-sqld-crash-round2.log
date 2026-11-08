@@ -1,0 +1,80 @@
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: standalone
+	- database path: /home/user/bench-local/work/libsql-latency-2/data.sqld
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:18090
+	- grpc_tls: no
+2026-11-08T03:43:46.284495Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:18090
+2026-11-08T03:43:46.289372Z  INFO restore: libsql_server::namespace::meta_store: restoring meta store
+2026-11-08T03:43:46.289401Z  INFO restore: libsql_server::namespace::meta_store: meta store restore completed
+2026-11-08T03:43:46.290225Z  INFO libsql_server: Server sending heartbeat to URL <not supplied> every 30s
+2026-11-08T03:43:46.294049Z  INFO create:try_new_primary:make_primary_connection_maker: libsql_server::replication::primary::logger: SQLite autocheckpoint: 1000
+thread 'tokio-runtime-worker' panicked at /home/runner/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sharded-slab-0.1.7/src/shard.rs:295:9:
+Thread count overflowed the configured max count. Thread index = 4096, max threads = 4096.
+stack backtrace:
+   0: rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <tracing_subscriber::layer::layered::Layered<L,S> as tracing_core::subscriber::Subscriber>::new_span
+   3: tracing::span::Span::make_with
+   4: tracing::span::Span::new
+   5: <libsql_server::connection::connection_manager::ManagedConnectionWalWrapper as libsql_sys::wal::wrapper::WrapWal<libsql_sys::wal::either::Either<libsql_sys::wal::sqlite3_wal::Sqlite3Wal,libsql_wal::wal::LibsqlWal<libsql_wal::io::StdIO,libsql_sys::wal::either::Either<libsql_wal::storage::async_storage::AsyncStorage<libsql_wal::storage::backend::s3::S3Backend<libsql_wal::io::StdIO>,libsql_wal::segment::sealed::SealedSegment<std::fs::File>>,libsql_wal::storage::NoStorage>>>>>::end_read_txn
+   6: libsql_sys::wal::ffi::end_read_transaction
+   7: pagerBeginReadTransaction
+   8: sqlite3PagerSharedLock
+   9: btreeBeginTrans
+  10: sqlite3VdbeExec
+  11: sqlite3_step
+  12: <rusqlite::row::Rows as fallible_streaming_iterator::FallibleStreamingIterator>::advance
+  13: tokio::runtime::task::raw::poll
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+thread 'tokio-runtime-worker' panicked at library/core/src/panicking.rs:221:5:
+panic in a function that cannot unwind
+stack backtrace:
+   0:     0x558e40c95df5 - <std::sys::backtrace::BacktraceLock::print::DisplayBacktrace as core::fmt::Display>::fmt::h1b9dad2a88e955ff
+   1:     0x558e3fb1d1eb - core::fmt::write::h4b5a1270214bc4a7
+   2:     0x558e40c928af - std::io::Write::write_fmt::hd04af345a50c312d
+   3:     0x558e40c96f51 - std::panicking::default_hook::{{closure}}::h96ab15e9936be7ed
+   4:     0x558e40c96c37 - std::panicking::default_hook::h3cacb9c27561ad33
+   5:     0x558e40c97599 - std::panicking::rust_panic_with_hook::hfe205f6954b2c97b
+   6:     0x558e40c97463 - std::panicking::begin_panic_handler::{{closure}}::h6cb44b3a50f28c44
+   7:     0x558e40c962c9 - std::sys::backtrace::__rust_end_short_backtrace::hf1c1f2a92799bb0e
+   8:     0x558e40c970a4 - rust_begin_unwind
+   9:     0x558e3f53de55 - core::panicking::panic_nounwind_fmt::h4c4dc67d0bbc166c
+  10:     0x558e3f53dee2 - core::panicking::panic_nounwind::hb98133c151c787e4
+  11:     0x558e3f53e026 - core::panicking::panic_cannot_unwind::he9511e6e72319a3e
+  12:     0x558e3fc8c229 - libsql_sys::wal::ffi::end_read_transaction::h0e26cc0842e9c8e8
+  13:     0x558e40e39aa3 - pagerBeginReadTransaction
+  14:     0x558e40ee9663 - sqlite3PagerSharedLock
+  15:     0x558e40ef717d - btreeBeginTrans
+  16:     0x558e40f6d333 - sqlite3VdbeExec
+  17:     0x558e40f73a50 - sqlite3_step
+  18:     0x558e40bf7cd9 - <rusqlite::row::Rows as fallible_streaming_iterator::FallibleStreamingIterator>::advance::hdc7333bd14b05354
+  19:     0x558e40a3b66f - tokio::runtime::task::raw::poll::h74edcf4093723dd0
+  20:     0x558e40cc922c - std::sys::backtrace::__rust_begin_short_backtrace::h43336d4b21488a29
+  21:     0x558e40ccae43 - core::ops::function::FnOnce::call_once{{vtable.shim}}::h5218553105c5c996
+  22:     0x558e40c9c77b - std::sys::pal::unix::thread::Thread::new::thread_start::ha8af9c992ef0b208
+  23:     0x7f2a4949cb84 - start_thread
+                               at ./nptl/pthread_create.c:447:8
+  24:     0x7f2a49529ecc - __GI___clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+  25:                0x0 - <unknown>
+thread caused non-unwinding panic. aborting.
+thread 'tokio-runtime-worker' panicked at /home/runner/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sharded-slab-0.1.7/src/shard.rs:295:9:
+Thread count overflowed the configured max count. Thread index = 4098, max threads = 4096.
+stack backtrace:
