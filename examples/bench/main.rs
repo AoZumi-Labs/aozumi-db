@@ -32,6 +32,7 @@
 //! - `micro`: point reads, single-row inserts and 100-row transactions,
 //!   plus the bare engine's point-read rate for comparison.
 
+mod embedded;
 mod ycsb;
 
 use std::collections::HashMap;
@@ -59,6 +60,8 @@ struct Args {
     url: Option<String>,
     token: Option<String>,
     prod: bool,
+    /// `ycsb-sqlite`: SQLite's `synchronous` level, `full` or `normal`.
+    synchronous: String,
 }
 
 /// `Bearer <token>` for every pipeline request, when the server checks tokens.
@@ -78,6 +81,7 @@ fn parse_args() -> Args {
         url: None,
         token: None,
         prod: false,
+        synchronous: "full".to_string(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -91,6 +95,11 @@ fn parse_args() -> Args {
             }
             "--prod" => {
                 parsed.prod = true;
+                continue;
+            }
+            "--synchronous" => {
+                parsed.synchronous = args.next().expect("full or normal after --synchronous");
+                assert!(matches!(parsed.synchronous.as_str(), "full" | "normal"), "--synchronous is full or normal");
                 continue;
             }
             _ => {}
@@ -113,6 +122,13 @@ fn parse_args() -> Args {
 fn main() {
     let args = parse_args();
     let dir = tempfile::tempdir().unwrap();
+    if args.mode == "ycsb-sqlite" {
+        let machine = format!("{} cores", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+        println!("YCSB on SQLite {} embedded (synchronous = {}), {} records, {} threads, {}s per workload, {machine}\n",
+            rusqlite::version(), args.synchronous, args.records, args.clients, args.seconds);
+        embedded::ycsb(dir.path(), args.records, args.clients, Duration::from_secs(args.seconds), &args.workloads, &args.synchronous);
+        return;
+    }
     let server = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     // The database's file in the in-process server's data directory.
     let database = if args.prod { "bench" } else { "default" };
