@@ -1,12 +1,14 @@
 //! Backups and point-in-time restore.
 //!
 //! A snapshot is a consistent copy of a database as one file, stored as
-//! `<database>/<id>.db`, or `<id>.manual.db` when it was asked for (see
+//! `<database>/<id>.db.zst`, or `<id>.manual.db.zst` when it was asked for (see
 //! [`Kind`]); ids are zero-padded unix milliseconds, so they sort by age and
 //! say when the snapshot was taken. With WAL shipping on, each snapshot the
 //! server takes on its own also starts a generation: the WAL frames committed
 //! after it, uploaded every few moments as segments
-//! `<database>/wal/<snapshot id>/<segment no>-<shipped at ms>.wal`. Restoring
+//! `<database>/wal/<snapshot id>/<segment no>-<shipped at ms>.wal.zst`.
+//! Everything is stored compressed with zstd (`.zst`); objects that earlier
+//! servers stored plain, without the suffix, are read as they are. Restoring
 //! to a time takes the newest generation at or before it and replays the
 //! page images of its segments shipped by then. A database's policy
 //! (`limits::BackupPolicy`) says how long its backups are kept.
@@ -187,8 +189,28 @@ impl BackupTarget {
     }
 }
 
+/// The suffix of objects stored compressed. Objects from before it are plain.
+const COMPRESSED: &str = ".zst";
+/// zstd's level 3: WAL segments shrink about a hundredfold (each commit writes
+/// whole pages, mostly the same ones again), snapshots about fivefold.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Compress an object to store, off the async threads: a snapshot can be large.
+async fn packed(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    Ok(tokio::task::spawn_blocking(move || zstd::encode_all(&bytes[..], ZSTD_LEVEL)).await??)
+}
+
+/// An object as it was before it was stored.
+async fn unpacked(bytes: Vec<u8>, compressed: bool) -> anyhow::Result<Vec<u8>> {
+    if !compressed {
+        return Ok(bytes);
+    }
+    Ok(tokio::task::spawn_blocking(move || zstd::decode_all(&bytes[..])).await??)
+}
+
+/// Where a new snapshot is stored.
 fn snapshot_key(db: &str, id: &str, kind: Kind) -> String {
-    format!("{db}/{id}{}", kind.suffix())
+    format!("{db}/{id}{}{COMPRESSED}", kind.suffix())
 }
 
 fn wal_dir(db: &str, generation: &str) -> String {
@@ -217,27 +239,41 @@ impl Kind {
         }
     }
 
-    /// The snapshot id and kind an object name holds.
-    fn parse(name: &str) -> Option<(&str, Kind)> {
+    /// The snapshot id and kind an object name holds, and whether it is
+    /// stored compressed.
+    fn parse(name: &str) -> Option<(&str, Kind, bool)> {
+        let (name, compressed) = match name.strip_suffix(COMPRESSED) {
+            Some(name) => (name, true),
+            None => (name, false),
+        };
         [Kind::Manual, Kind::BeforeRestore, Kind::Scheduled]
             .into_iter()
-            .find_map(|kind| name.strip_suffix(kind.suffix()).filter(|id| valid_id(id)).map(|id| (id, kind)))
+            .find_map(|kind| name.strip_suffix(kind.suffix()).filter(|id| valid_id(id)).map(|id| (id, kind, compressed)))
     }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BackupInfo {
     pub id: String,
+    /// What the backup takes in the store: compressed, for all but those
+    /// that earlier servers stored plain.
     pub size_bytes: u64,
     /// When it was taken, in unix milliseconds: the id as a number.
     pub taken_ms: u64,
     pub kind: Kind,
+    #[serde(skip)]
+    compressed: bool,
 }
 
 impl BackupInfo {
-    fn new(id: String, size_bytes: u64, kind: Kind) -> Self {
+    fn new(id: String, size_bytes: u64, kind: Kind, compressed: bool) -> Self {
         let taken_ms = id.parse().unwrap_or(0);
-        Self { id, size_bytes, taken_ms, kind }
+        Self { id, size_bytes, taken_ms, kind, compressed }
+    }
+
+    /// Where it is in the store.
+    fn key(&self, db: &str) -> String {
+        format!("{db}/{}{}{}", self.id, self.kind.suffix(), if self.compressed { COMPRESSED } else { "" })
     }
 }
 
@@ -460,8 +496,9 @@ impl Backups {
         let policy = registry.open(db, false).await?.backup_policy;
         let snapshot = registry.snapshot(db).await?;
         let id = self.next_id().await;
-        let info = BackupInfo::new(id.clone(), snapshot.bytes.len() as u64, kind);
-        config.target.put(&snapshot_key(db, &id, kind), snapshot.bytes).await?;
+        let stored = packed(snapshot.bytes).await?;
+        let info = BackupInfo::new(id.clone(), stored.len() as u64, kind, true);
+        config.target.put(&snapshot_key(db, &id, kind), stored).await?;
         // Only the server's own snapshots start a WAL generation, so pruning
         // a backup someone asked for never cuts the point-in-time history.
         if config.wal_every.is_some() && kind == Kind::Scheduled {
@@ -495,10 +532,10 @@ impl Backups {
         let stored = async {
             let config = self.config()?;
             let policy = registry.open(db, false).await?.backup_policy;
-            let bytes = bytes?;
+            let stored = packed(bytes?).await?;
             let id = self.next_id().await;
-            let info = BackupInfo::new(id.clone(), bytes.len() as u64, Kind::BeforeRestore);
-            config.target.put(&snapshot_key(db, &id, Kind::BeforeRestore), bytes).await?;
+            let info = BackupInfo::new(id.clone(), stored.len() as u64, Kind::BeforeRestore, true);
+            config.target.put(&snapshot_key(db, &id, Kind::BeforeRestore), stored).await?;
             self.prune(db, &policy).await?;
             Ok(info)
         }
@@ -522,7 +559,7 @@ impl Backups {
                     keys.push(format!("{}{}", wal_dir(db, &snapshot.id), segment.name));
                 }
             }
-            keys.push(snapshot_key(db, &snapshot.id, snapshot.kind));
+            keys.push(snapshot.key(db));
         }
         Ok(keys)
     }
@@ -557,8 +594,8 @@ impl Backups {
         }
         let mut out = Vec::new();
         for (name, size_bytes) in self.config()?.target.list(&format!("{db}/")).await? {
-            if let Some((id, kind)) = Kind::parse(&name) {
-                out.push(BackupInfo::new(id.to_string(), size_bytes, kind));
+            if let Some((id, kind, compressed)) = Kind::parse(&name) {
+                out.push(BackupInfo::new(id.to_string(), size_bytes, kind, compressed));
             }
         }
         out.sort_by(|a, b| b.id.cmp(&a.id));
@@ -624,8 +661,8 @@ impl Backups {
             id => snapshots.iter().find(|s| s.id == id),
         }
         .ok_or(BackupError::NotFound)?;
-        let bytes = target.get(&snapshot_key(db, &found.id, found.kind)).await?.ok_or(BackupError::NotFound)?;
-        Ok((bytes, found.clone()))
+        let bytes = target.get(&found.key(db)).await?.ok_or(BackupError::NotFound)?;
+        Ok((unpacked(bytes, found.compressed).await?, found.clone()))
     }
 
     /// The database as it was at `at_ms`: the newest snapshot at or before
@@ -642,7 +679,8 @@ impl Backups {
             .filter(|s| config.wal_every.is_none() || s.kind == Kind::Scheduled)
             .find(|s| s.taken_ms <= at_ms)
             .ok_or(BackupError::NotFound)?;
-        let mut bytes = target.get(&snapshot_key(db, &snapshot.id, snapshot.kind)).await?.ok_or(BackupError::NotFound)?;
+        let bytes = target.get(&snapshot.key(db)).await?.ok_or(BackupError::NotFound)?;
+        let mut bytes = unpacked(bytes, snapshot.compressed).await?;
         let mut restored_to_ms = snapshot.taken_ms;
         for (n, segment) in self.segments(db, &snapshot.id).await?.into_iter().enumerate() {
             // Segments are numbered from 0; stop at a gap or past the time.
@@ -651,7 +689,7 @@ impl Backups {
             }
             let key = format!("{}{}", wal_dir(db, &snapshot.id), segment.name);
             let frames = target.get(&key).await?.ok_or(BackupError::NotFound)?;
-            apply_frames(&mut bytes, &frames)?;
+            apply_frames(&mut bytes, &unpacked(frames, segment.compressed).await?)?;
             restored_to_ms = segment.shipped_ms;
         }
         Ok(Restored { bytes, restored_to_ms })
@@ -752,7 +790,7 @@ impl Backups {
             wal_frames = position.frame;
             let Some((bytes, last)) = frames else { break };
             let key = format!("{}{}", wal_dir(db, &generation), Segment::name(next_segment, now_ms()));
-            match self.config()?.target.put(&key, bytes).await {
+            match self.config()?.target.put(&key, packed(bytes).await?).await {
                 Ok(()) => {
                     next_frame = last + 1;
                     next_segment += 1;
@@ -877,7 +915,7 @@ impl Backups {
                     config.target.delete(&format!("{}{}", wal_dir(db, &old.id), segment.name)).await?;
                 }
             }
-            config.target.delete(&snapshot_key(db, &old.id, old.kind)).await?;
+            config.target.delete(&old.key(db)).await?;
         }
         Ok(())
     }
@@ -893,16 +931,22 @@ struct Segment {
     name: String,
     number: u64,
     shipped_ms: u64,
+    compressed: bool,
 }
 
 impl Segment {
+    /// The name a new segment is stored under.
     fn name(number: u64, shipped_ms: u64) -> String {
-        format!("{number:010}-{shipped_ms:013}.wal")
+        format!("{number:010}-{shipped_ms:013}.wal{COMPRESSED}")
     }
 
     fn parse(name: String) -> Option<Self> {
-        let (number, shipped) = name.strip_suffix(".wal")?.split_once('-')?;
-        Some(Self { number: number.parse().ok()?, shipped_ms: shipped.parse().ok()?, name })
+        let (plain, compressed) = match name.strip_suffix(COMPRESSED) {
+            Some(plain) => (plain, true),
+            None => (name.as_str(), false),
+        };
+        let (number, shipped) = plain.strip_suffix(".wal")?.split_once('-')?;
+        Some(Self { number: number.parse().ok()?, shipped_ms: shipped.parse().ok()?, compressed, name })
     }
 }
 
@@ -1022,14 +1066,18 @@ mod tests {
 
     #[test]
     fn snapshot_names_carry_their_kind() {
-        assert_eq!(Kind::parse("0001761000000000.db"), Some(("0001761000000000", Kind::Scheduled)));
-        assert_eq!(Kind::parse("1761000000000.manual.db"), Some(("1761000000000", Kind::Manual)));
-        assert_eq!(Kind::parse("1761000000000.before-restore.db"), Some(("1761000000000", Kind::BeforeRestore)));
+        // Stored plain by earlier servers.
+        assert_eq!(Kind::parse("0001761000000000.db"), Some(("0001761000000000", Kind::Scheduled, false)));
+        assert_eq!(Kind::parse("1761000000000.manual.db"), Some(("1761000000000", Kind::Manual, false)));
+        assert_eq!(Kind::parse("1761000000000.before-restore.db"), Some(("1761000000000", Kind::BeforeRestore, false)));
+        // Stored compressed.
+        assert_eq!(Kind::parse("1761000000000.manual.db.zst"), Some(("1761000000000", Kind::Manual, true)));
         assert_eq!(Kind::parse("1761000000000.other.db"), None, "an unknown kind is not a snapshot here");
+        assert_eq!(Kind::parse("1761000000000.db.gz"), None);
         assert_eq!(Kind::parse(".123.partial"), None);
         for kind in [Kind::Scheduled, Kind::Manual, Kind::BeforeRestore] {
             let key = snapshot_key("app", "1761000000000", kind);
-            assert_eq!(Kind::parse(key.strip_prefix("app/").unwrap()), Some(("1761000000000", kind)));
+            assert_eq!(Kind::parse(key.strip_prefix("app/").unwrap()), Some(("1761000000000", kind, true)));
         }
     }
 
