@@ -222,6 +222,94 @@ per request on a kept-alive connection.
   At 15 times the requests a second it uses up its CPU share. The same
   probe with 2 vCPUs had a p99 of 3.3 ms and 6,802 reads a second.
 
+## Head-to-head on a dedicated machine: aozumi-db, libSQL's server and SQLite (2026-11-08)
+
+The first numbers here from a quiet, dedicated machine of the kind AOZUMI
+runs on. `bench/head-to-head.sh` ran five contenders through the same YCSB
+workloads and the same open-loop write run, three rounds, the order rotated
+each round:
+
+- **aozumi-db**, this branch, at its default durability (`synchronous =
+  FULL`, which production runs) and at `NORMAL`.
+- **libSQL's server** (`sqld` 0.24.32, its defaults, which are `NORMAL`).
+- **SQLite 3.46.0 embedded**: the same statements on SQLite's C library in
+  the benchmark process (`bench ycsb-sqlite`), one WAL connection per
+  client thread, 5 s busy timeout, `FULL` and `NORMAL`. It has no network,
+  protocol or server, so it is the ceiling an embedded app gets.
+
+The servers were reached over HTTP with libSQL's protocol, from the same
+machine. 100,000 records, 32 clients, 20 s per workload.
+
+**Machine:** AWS c7g.2xlarge (8 Graviton3 vCPUs, not burstable), Ubuntu 24.04
+(kernel 7.0), ap-south-1. Data on its own 40 GB gp3 volume, ext4 with
+`fast_commit`, mounted `noatime`, like production's.
+
+Medians of the three rounds. Raw output: `bench/results/2026-11-08-head-to-head/`.
+
+| ops/s (p99.9) | aozumi-db FULL | aozumi-db NORMAL | sqld (NORMAL) | SQLite FULL | SQLite NORMAL |
+|---|---:|---:|---:|---:|---:|
+| A: 50% update | 1,046 (137 ms) | 11,365 (434 ms) | 102 (106 ms) | 1,011 (3,334 ms) | 55,996 (104 ms) |
+| B: 5% update | 10,233 (70 ms) | 44,145 (4 ms) | 48 (15 ms) | 9,448 (933 ms) | 123,468 (37 ms) |
+| C: read only | 44,234 (2 ms) | 43,784 (2 ms) | 3,636 (26 ms) | 179,037 (1 ms) | 181,524 (1 ms) |
+| D: 5% insert, latest | 9,541 (78 ms) | 41,522 (7 ms) | 51 (18 ms) | 8,379 (1,034 ms) | 137,220 (37 ms) |
+| E: 95% short scans | 3,670 (26 ms) | 3,699 (27 ms) | 56 (31 ms) | 8,004 (831 ms) | 8,840 (12 ms) |
+| F: read-modify-write | 1,025 (77 ms) | 10,429 (334 ms) | 4 (18 ms) | 990 (3,534 ms) | 34,312 (79 ms) |
+| failed operations, all rounds | 0 | 0 | 990, mostly timeouts | 82 (busy) | 0 |
+
+| Open-loop writes, 1,000 tx/s, 32 connections | p50 | p99 | p99.9 | rounds completed |
+|---|---:|---:|---:|---:|
+| aozumi-db FULL | 8,948 ms | 17,733 ms | 17,894 ms | 3 of 3 |
+| aozumi-db NORMAL | 1.13 ms | 1.72 ms | 5.35 ms | 3 of 3 |
+| sqld | (no result) | | | 0 of 3: the client failed once and the server stalled twice |
+
+What this shows:
+
+- **Against libSQL's server, at the same durability (`NORMAL`):** about 110
+  times the throughput on A, 12 times on reads, and no failures. `sqld`
+  timed out on every workload with writes. In the open-loop run it never
+  produced a result: once the client failed against it, twice it stopped
+  answering. One stalled server, stopped after 15 minutes, was at 618% CPU
+  with 3,855 threads. On a second machine (below) the same run made `sqld`
+  hit its 4,096-thread cap and abort.
+- **Against embedded SQLite at `FULL`:** the same write throughput (A 1,046
+  against 1,011 ops/s: both wait for the disk once per commit), with the
+  worst 0.1% of requests 24 times shorter (137 ms against 3,334 ms) and no
+  failures. SQLite's busy handler lets an unlucky writer sleep and retry
+  for seconds; aozumi-db's writers queue in order (D19). This is what the
+  queue buys.
+- **Against embedded SQLite at all:** an embedded library is faster per
+  operation, about 4 times on reads and 5 on writes at `NORMAL`, because a
+  server pays for HTTP, JSON and a hop to the blocking pool on every
+  request. That is the cost of being a server, not of the engine.
+- **`FULL` cannot keep up with 1,000 commits a second on this volume, and
+  the queue then grows without bound.** Each commit waits for its own flush
+  (about 2 ms on gp3 with `fast_commit`), so one database commits about 500
+  times a second at `FULL`. Offered 1,000 a second for 20 s, every commit
+  was eventually made, but the median waited 9 s and the slowest 18 s.
+  Two changes follow: a deadline and a cap on the writer queue, so an
+  overloaded database answers busy at once instead of making everyone wait;
+  and group commit, so the commits queued behind one flush share the next.
+- **`NORMAL`'s A and F have a long tail** (p99.9 334 to 434 ms against p99
+  3 to 4 ms), the same three rounds running. A WAL checkpoint is the likely
+  cause; not yet investigated.
+
+### The same run on a shared cloud container (2026-11-08)
+
+The same script on a 4-vCPU x86_64 cloud container shared with other work,
+the disk unknown: a second data point, not a published number. Medians of
+three rounds (`local-raw.md`):
+
+| ops/s (p99.9) | aozumi-db FULL | aozumi-db NORMAL | sqld | SQLite FULL | SQLite NORMAL |
+|---|---:|---:|---:|---:|---:|
+| A | 3,029 (48 ms) | 11,548 (38 ms) | 378 (316 ms) | 9,667 (1,031 ms) | 42,483 (104 ms) |
+| C | 25,396 (21 ms) | 23,981 (28 ms) | 2,698 (50 ms) | 120,368 (5 ms) | 121,667 (5 ms) |
+| open-loop 1,000 tx/s, p99 | 15.85 ms | 4.56 ms | crashed in round 2, stalled in round 3 | | |
+
+This disk makes a flush much cheaper than gp3 does (SQLite `FULL` A reaches
+9,667 ops/s here against 1,011 there), so `FULL` keeps up with the
+open-loop run here. In round 2, `sqld` reached its 4,096-thread cap and
+aborted (`local-sqld-crash-round2.log`).
+
 ## Head-to-head with libSQL's server (2026-10-26)
 
 `bench/head-to-head.sh` runs the same YCSB and open-loop client against

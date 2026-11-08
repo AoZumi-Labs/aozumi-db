@@ -1,0 +1,2 @@
+machine: 8 vCPU c7g.2xlarge, 7.0.0-1014-aws, data volume: /dev/nvme1n1 ext4   rw,noatime
+Filesystem features:      has_journal ext_attr resize_inode dir_index fast_commit filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
