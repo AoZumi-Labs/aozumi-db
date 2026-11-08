@@ -308,3 +308,13 @@ async fn a_rotation_outlives_deleting_the_database() {
     assert_eq!(status_with(&server, &offline).await, StatusCode::OK);
     assert!(aozumi_db::token_generation(server.dir.path(), "../notes").is_err());
 }
+
+#[tokio::test]
+async fn a_huge_ttl_mints_a_working_token() {
+    let server = TestServer::with_secret().await;
+    create(&server, "notes").await;
+    let (status, body) = admin(&server, Method::POST, "/v1/databases/notes/tokens", Some(json!({"ttl_seconds": u64::MAX}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = server.pipeline(body["token"].as_str(), select_close("SELECT 1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

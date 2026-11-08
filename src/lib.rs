@@ -861,7 +861,7 @@ async fn create_token(state: &State, name: &str, req: Request<Incoming>) -> Resp
     let claims = Claims {
         db: name.to_string(),
         generation: db.token_generation,
-        exp: body.ttl_seconds.map(|ttl| unix_now() + ttl),
+        exp: body.ttl_seconds.map(|ttl| unix_now().saturating_add(ttl)),
         read_only: body.read_only,
     };
     json(StatusCode::OK, &json!({"token": auth::mint(secret, &claims)}))
