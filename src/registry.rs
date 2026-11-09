@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use turso_core::CheckpointMode;
 
+use crate::durability::Durability;
 use crate::engine::{self, Conn, ConnOptions, Db, Synchronous, WalPosition};
 use crate::limits::{BackupPolicy, BackupPolicyPatch, Limits, LimitsPatch};
 use crate::proto::Value;
@@ -45,6 +46,8 @@ pub struct OpenDb {
     /// instead of writing to it, and a stream on it ends with its request.
     closing: Arc<AtomicBool>,
     synchronous: Synchronous,
+    /// With group commit, answers wait here until what they saw is on disk.
+    pub durability: Arc<Durability>,
 }
 
 /// Idle connections of one database, kept per access level. Connections
@@ -307,6 +310,8 @@ impl Registry {
             move || {
                 let conn = Conn::open(&db.db, &ConnOptions { busy_timeout: SNAPSHOT_LOCK_WAIT, ..db.internal_options() })?;
                 conn.execute_script("BEGIN IMMEDIATE")?;
+                // No commit can land now; copy only what is on disk.
+                db.durability.sync_blocking();
                 match copy_files(&dir, &file, &work) {
                     Ok(()) => anyhow::Ok(Held { conn, file: work.join(&file), dir: work }),
                     Err(err) => {
@@ -594,7 +599,11 @@ impl Registry {
                 Some(Value::Integer(size)) if *size > 0 => *size as u64,
                 other => anyhow::bail!("unexpected page size {other:?}"),
             };
+            let wal = PathBuf::from(format!("{}-wal", path.display()));
+            let internal = ConnOptions { synchronous, ..Default::default() };
+            let durability = Durability::new(synchronous == Synchronous::Group, db.clone(), wal, internal);
             Ok(OpenDb {
+                durability,
                 db,
                 limits,
                 backup_policy,
@@ -696,6 +705,8 @@ fn snapshot_files(db: &OpenDb, dir: &std::path::Path, file: &str, work: &std::pa
     let copied = (|| {
         // Taken under the write lock: exactly what the copy will contain.
         let wal = conn.wal_position()?;
+        // A copy (a backup, a branch) holds only commits that are on disk.
+        db.durability.sync_blocking();
         copy_files(dir, file, work)?;
         anyhow::Ok(wal)
     })();

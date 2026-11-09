@@ -4,6 +4,7 @@
 mod auth;
 mod backup;
 mod console;
+mod durability;
 mod engine;
 mod limits;
 mod policy;
@@ -385,16 +386,19 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         false => None,
     };
     // Statements block on disk and CPU, so they run on the blocking pool.
-    let (stream, results) = match tokio::task::spawn_blocking(move || {
+    let (stream, results, seen) = match tokio::task::spawn_blocking(move || {
         let results = msg.requests.iter().map(|request| stream.handle(request)).collect::<Vec<_>>();
-        (stream, results)
+        let seen = stream.seen();
+        (stream, results, seen)
     })
     .await
     {
         Ok(done) => done,
         Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")),
     };
+    // The next writer goes ahead while this answer waits for the flush.
     drop(turn);
+    db.durability.wait(seen).await;
 
     let baton = match stream.is_closed() {
         true => {
@@ -501,12 +505,13 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     };
     let started = Instant::now();
     let dry_run = body.dry_run;
-    let (stream, statements) = match tokio::task::spawn_blocking(move || {
+    let (stream, statements, seen) = match tokio::task::spawn_blocking(move || {
         let statements = match dry_run {
             true => stream.run_console_dry(split),
             false => Ok(stream.run_console(split)),
         };
-        (stream, statements)
+        let seen = stream.seen();
+        (stream, statements, seen)
     })
     .await
     {
@@ -514,6 +519,7 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
         Err(err) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")),
     };
     drop(turn);
+    db.durability.wait(seen).await;
     stream.release();
     let statements = match statements {
         Ok(statements) => statements,
@@ -577,13 +583,15 @@ async fn console_read<T: Send + 'static>(
         .checkout(BUSY_TIMEOUT, true)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     let pool = db.pool.clone();
-    let (conn, result) = tokio::task::spawn_blocking(move || {
+    let (conn, result, seen) = tokio::task::spawn_blocking(move || {
         let result = read(&conn);
-        (conn, result)
+        let seen = conn.seen();
+        (conn, result, seen)
     })
     .await
     .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("statement execution failed: {err}")))?;
     pool.put(conn, true);
+    db.durability.wait(seen).await;
     result.map_err(|error| match console::is_missing_table(&error) {
         true => console_error(StatusCode::NOT_FOUND, "That table is not in this database.", "table_not_found"),
         false => console_error(StatusCode::UNPROCESSABLE_ENTITY, &error.message, error.code.as_deref().unwrap_or("SQLITE_ERROR")),

@@ -66,7 +66,8 @@ async fn serve(secret: Option<Vec<u8>>) -> anyhow::Result<()> {
             eprintln!("aozumi-db: synchronous = normal: commits reach the disk at checkpoints; a power loss can lose the last few");
             Synchronous::Normal
         }
-        Ok(other) => anyhow::bail!("AOZUMI_DB_SYNCHRONOUS must be full or normal, got {other:?}"),
+        Ok("group") => Synchronous::Group,
+        Ok(other) => anyhow::bail!("AOZUMI_DB_SYNCHRONOUS must be full, group or normal, got {other:?}"),
     };
     if config.backup.is_none() {
         eprintln!("aozumi-db: AOZUMI_DB_BACKUP_URL is unset, so nothing is backed up");

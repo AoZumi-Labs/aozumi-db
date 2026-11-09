@@ -49,6 +49,11 @@ impl Stream {
         }
     }
 
+    /// How far into the WAL the stream's connection has seen.
+    pub fn seen(&self) -> Option<crate::engine::WalPosition> {
+        self.conn.seen()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }

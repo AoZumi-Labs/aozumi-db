@@ -32,6 +32,11 @@ pub enum Synchronous {
     /// Commits are flushed at checkpoints. A crash of the server keeps
     /// every commit; a power loss can lose the last few. Faster writes.
     Normal,
+    /// As durable as `Full`, with one flush shared by the commits queued
+    /// behind it (group commit, D33): the engine writes commits without a
+    /// flush, and the server flushes and holds every answer until what it
+    /// saw is on disk (`durability`).
+    Group,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,7 +95,7 @@ impl Conn {
         if let Some(timeout) = options.statement_timeout {
             inner.set_query_timeout(timeout);
         }
-        if options.synchronous == Synchronous::Normal {
+        if matches!(options.synchronous, Synchronous::Normal | Synchronous::Group) {
             inner.execute("PRAGMA synchronous = NORMAL")?;
         }
         if let Some(pages) = options.max_pages {
@@ -198,6 +203,13 @@ impl Conn {
     /// Run every statement in `sql`, ignoring rows.
     pub fn execute_script(&self, sql: &str) -> Result<(), Error> {
         self.inner.execute(sql).map_err(|err| self.error(err))
+    }
+
+    /// How far into the WAL this connection's last read or commit saw.
+    /// Starts no read. `None` if the engine cannot say.
+    pub fn seen(&self) -> Option<WalPosition> {
+        let state = self.inner.wal_state().ok()?;
+        Some(WalPosition { seq: state.checkpoint_seq_no, frame: state.max_frame })
     }
 
     /// The WAL's current position, as of now rather than this connection's

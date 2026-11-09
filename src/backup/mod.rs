@@ -962,6 +962,9 @@ fn read_new_frames(open: &OpenDb, next: u64) -> anyhow::Result<(WalPosition, Opt
     if position.frame < next {
         return Ok((position, None));
     }
+    // Ship only commits that are on disk: a backup must never hold one that
+    // a power loss takes from the database itself.
+    open.durability.sync_blocking();
     let (bytes, last) = conn.committed_frames(next, position.frame, open.page_size as usize)?;
     Ok((position, (!bytes.is_empty()).then_some((bytes, last))))
 }
