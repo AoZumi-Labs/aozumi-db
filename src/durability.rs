@@ -41,6 +41,9 @@ struct State {
     completed: u64,
     requested: u64,
     flushing: bool,
+    /// How far the WAL was committed when the running flush began: that
+    /// flush covers whoever saw no further.
+    in_flight: Option<WalPosition>,
 }
 
 /// Whether a WAL flushed when it stood at `durable` holds what a connection
@@ -77,9 +80,10 @@ impl Durability {
                     return;
                 }
             }
-            // A flush already running may have started before this commit
-            // was written, so it needs the one after.
-            let need = state.completed + if state.flushing { 2 } else { 1 };
+            // A flush already running covers what it found committed when it
+            // began; anything newer needs the flush after it.
+            let running_covers = matches!((state.in_flight, seen), (Some(at), Some(seen)) if covers(at, seen));
+            let need = state.completed + if state.flushing && !running_covers { 2 } else { 1 };
             state.requested = state.requested.max(need);
             let lead = !state.flushing;
             state.flushing = true;
@@ -120,6 +124,7 @@ impl Durability {
             {
                 let mut state = self.state.lock().unwrap();
                 state.completed = number;
+                state.in_flight = None;
                 if let Some(position) = position {
                     if state.durable.is_none_or(|durable| !covers(durable, position)) {
                         state.durable = Some(position);
@@ -142,6 +147,7 @@ impl Durability {
             // request can skip waiting on its account.
             probe.as_ref().and_then(|conn| conn.wal_position().ok())
         };
+        self.state.lock().unwrap().in_flight = position;
         self.sync_blocking();
         position
     }
