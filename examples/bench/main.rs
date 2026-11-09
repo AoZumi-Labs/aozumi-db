@@ -62,6 +62,8 @@ struct Args {
     prod: bool,
     /// `ycsb-sqlite`: SQLite's `synchronous` level, `full` or `normal`.
     synchronous: String,
+    /// `writes`: the connection counts to sweep.
+    sweep: Vec<usize>,
 }
 
 /// `Bearer <token>` for every pipeline request, when the server checks tokens.
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
         token: None,
         prod: false,
         synchronous: "full".to_string(),
+        sweep: vec![1, 2, 4, 8, 16, 32, 64],
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -95,6 +98,10 @@ fn parse_args() -> Args {
             }
             "--prod" => {
                 parsed.prod = true;
+                continue;
+            }
+            "--sweep" => {
+                parsed.sweep = args.next().expect("a list such as 1,2,4 after --sweep").split(',').map(|n| n.trim().parse().expect("a number in --sweep")).collect();
                 continue;
             }
             "--synchronous" => {
@@ -190,6 +197,7 @@ fn main() {
                 .await;
             }
         }),
+        "writes" => clients.block_on(writes(&url, &args.sweep, duration)),
         "latency" => clients.block_on(async {
             println!("Open-loop write latency, {} tx/s, {} connections, {}s, {machine}\n", args.rate, args.clients, args.seconds);
             assert!(send(&new_client(), &url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await);
@@ -386,6 +394,9 @@ async fn closed_loop(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    if WARMUP.load(Ordering::Relaxed) {
+        return;
+    }
     println!(
         "| {label} | {:.0} | {:.2} ms | {:.2} ms | {:.2} ms | {detail} | {errors} |",
         overall.len() as f64 / elapsed,
@@ -448,6 +459,55 @@ async fn open_loop(url: &str, connections: usize, rate: u64, duration: Duration)
         ms(pct(&all, 0.999)),
         ms(*all.last().unwrap())
     );
+}
+
+/// Turso's concurrent-write benchmark (tursodatabase/turso, perf/throughput)
+/// over this server's HTTP API: `test_table(id INTEGER PRIMARY KEY, data
+/// TEXT)`, each transaction `BEGIN`, 100 inserts with ids from one counter
+/// shared by every connection, `COMMIT`, sent as one pipeline; a closed loop
+/// per connection, swept over connection counts, each after a 3 s warmup.
+/// The rows are counted after each step: 100 per committed transaction.
+async fn writes(url: &str, sweep: &[usize], duration: Duration) {
+    const BATCH: u64 = 100;
+    let client = new_client();
+    assert!(send(&client, url, vec![execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")]).await);
+    let next = Arc::new(AtomicU64::new(0));
+    println!("writes: each transaction inserts {BATCH} rows; {}s per step after a 3 s warmup\n", duration.as_secs());
+    println!("| connections | tx/s | p50 | p99 | p99.9 | by operation (p50 / p99) | failed: busy or timed out |");
+    println!("|---|---:|---:|---:|---:|---|---:|");
+    for &connections in sweep {
+        let transaction = {
+            let next = next.clone();
+            move |_rng: &mut rand::rngs::StdRng| {
+                let first = next.fetch_add(BATCH, Ordering::Relaxed);
+                let mut requests = vec![execute("BEGIN")];
+                requests.extend((first..first + BATCH).map(|id| execute_args("INSERT INTO test_table (id, data) VALUES (?, ?)", json!([int(id), text(format!("row {id} of the throughput benchmark"))]))));
+                requests.push(execute("COMMIT"));
+                ("txn", requests)
+            }
+        };
+        WARMUP.store(true, Ordering::Relaxed);
+        closed_loop("warmup", url, connections, Duration::from_secs(3), transaction.clone()).await;
+        WARMUP.store(false, Ordering::Relaxed);
+        closed_loop(&connections.to_string(), url, connections, duration, transaction).await;
+    }
+    let body = send_rows(&client, url, "SELECT count(*) FROM test_table").await;
+    println!("\nrows: {body} (100 per committed transaction, warmups included)");
+}
+
+/// Whether the closed loop's table row is for a warmup, and not printed.
+static WARMUP: AtomicBool = AtomicBool::new(false);
+
+/// The first value of the first row of one query, as text.
+async fn send_rows(client: &HttpClient, url: &str, sql: &str) -> String {
+    let body = json!({"baton": null, "requests": [execute(sql), {"type": "close"}]}).to_string();
+    let mut request = Request::post(url);
+    if let Some(auth) = AUTH.get() {
+        request = request.header("authorization", auth);
+    }
+    let response = client.request(request.body(Full::new(Bytes::from(body))).unwrap()).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    parsed["results"][0]["response"]["result"]["rows"][0][0]["value"].as_str().unwrap_or("?").to_string()
 }
 
 async fn micro(url: &str, clients: usize, duration: Duration) {
