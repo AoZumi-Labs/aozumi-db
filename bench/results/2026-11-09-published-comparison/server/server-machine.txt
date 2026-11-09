@@ -1,0 +1,6 @@
+server: 8 vCPU, Neoverse-V1
+AWS Graviton3 AWS Graviton3 CPU @ 2.6GHz, kernel 7.0.0-1014-aws, aozumi-db d84b06d
+/nvme: /dev/nvme1n1 ext4   rw,noatime Amazon EC2 NVMe Instance Storage
+Filesystem features:      has_journal ext_attr resize_inode dir_index fast_commit filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
+/gp3: /dev/nvme2n1 ext4   rw,noatime Amazon Elastic Block Store
+Filesystem features:      has_journal ext_attr resize_inode dir_index fast_commit filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum

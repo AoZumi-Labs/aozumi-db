@@ -1,0 +1,2 @@
+client: 8 vCPU, Neoverse-V1
+AWS Graviton3 AWS Graviton3 CPU @ 2.6GHz, kernel 7.0.0-1014-aws; server at http://172.31.37.64:18090 (same subnet, ap-south-1a)

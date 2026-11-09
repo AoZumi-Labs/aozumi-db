@@ -222,6 +222,115 @@ per request on a kept-alive connection.
   At 15 times the requests a second it uses up its CPU share. The same
   probe with 2 vCPUs had a p99 of 3.3 ms and 6,802 reads a second.
 
+## Against published numbers (2026-11-09)
+
+There is no official public benchmark for SQLite or for SQLite servers, and
+no neutral table that sets them side by side. What exists is papers, vendor
+posts and blog figures, each on its own workload and hardware. The two below
+publish their method in full and sit closest to what aozumi-db is, so
+aozumi-db was run with the same workload settings as each, and only
+aozumi-db was run: the other numbers are as published.
+
+**Machines:** AWS ap-south-1a. The server was a c7gd.2xlarge (8 Graviton3
+vCPUs), with data on its local NVMe drive or on a 40 GB gp3 volume (the kind
+AOZUMI's production uses), both ext4 with `fast_commit`, mounted `noatime`.
+For YCSB, the load came from a second c7g.2xlarge in the same subnet (0.4 ms
+round trip). aozumi-db `d84b06d`, at its default durability
+(`synchronous = FULL`). Three repeats of each test, medians below. Raw
+output is in `bench/results/2026-11-09-published-comparison/`.
+
+![aozumi-db against published numbers](bench/results/2026-11-09-published-comparison/published-comparison.png)
+
+### Turso's concurrent-write benchmark
+
+The workload of [tursodatabase/turso `perf/throughput`](https://github.com/tursodatabase/turso/tree/main/perf/throughput),
+the benchmark behind Turso 0.8's concurrent-write numbers, run as `bench
+writes`:
+
+- `test_table(id INTEGER PRIMARY KEY, data TEXT)`;
+- each transaction is `BEGIN`, 100 inserts with ids from one shared counter,
+  then `COMMIT`, with `synchronous = FULL`;
+- a closed loop per connection, swept over 1 to 64 connections, 30 s per step
+  after a 3 s warmup;
+- the sweep order alternated between repeats, and the page cache was dropped
+  between them.
+
+aozumi-db is reached over HTTP with libSQL's protocol, one request per
+transaction. Turso and SQLite run in process.
+
+| transactions/s (p99.9) | 1 | 8 | 32 | 64 |
+|---|---:|---:|---:|---:|
+| **aozumi-db, local NVMe** | 795 (3.8 ms) | **1,820** (10 ms) | 1,587 (**33 ms**) | **1,521** (67 ms) |
+| aozumi-db, gp3 | 319 (13 ms) | 419 (33 ms) | 420 (90 ms) | 419 (166 ms) |
+| SQLite (published) | | | (about 1.2 s) | about 1,370 |
+| Turso 0.8, `BEGIN CONCURRENT` (published) | | | (about 2.4 ms) | about 9,500 |
+
+The SQLite and Turso figures are from Turso's [0.8 release post](https://turso.tech/blog/turso-0.8.0)
+(SQLite 3.50.2), as summarised by a web search. Its hardware is not known
+here. The post itself was not readable from the machine that wrote this.
+
+- **Against SQLite:** about the same throughput at 64 connections (1.1
+  times), and a worst 0.1% about 36 times shorter at 32 connections, with no
+  failures in any run. Both commit one transaction per flush; aozumi-db's
+  writers take turns in order (D19), while SQLite's busy handler leaves some
+  writers sleeping for a second.
+- **Against Turso 0.8: about 6 times fewer transactions.** Turso runs
+  transactions concurrently (MVCC, `BEGIN CONCURRENT`) and serialises them
+  only at commit. aozumi-db runs one writer at a time and flushes once per
+  commit. Group commit, where the commits queued behind one flush share the
+  next, is the step that closes most of this gap.
+- **On gp3 the disk sets the rate.** A flush takes about 2.4 ms, so about 420
+  commits a second whatever the connection count, and the queue time grows
+  with each connection added.
+
+### mvSQLite's YCSB numbers
+
+[mvSQLite's published YCSB run](https://github.com/losfair/mvsqlite/wiki/YCSB-numbers):
+SQLite on FoundationDB, served over the network. 1,000,000 records, 64
+threads, go-ycsb on its own c6i.2xlarge, 200 s per workload. The backend was
+3 × i4i.large running FoundationDB with double replication, plus a
+c5.2xlarge for mvstore. aozumi-db ran the same core workloads with the same
+record count, client count and separate load generator, through `bench
+ycsb` (Zipfian 0.99, ten 100-byte fields), for 60 s per workload, against
+one server.
+
+| ops/s | aozumi-db | mvSQLite (published) | |
+|---|---:|---:|---|
+| A: 50% update | 9,334 | 3,906 | 2.4 times |
+| B: 5% update | 43,597 | 8,650 | 5.0 times |
+| C: read only | 46,256 | 11,243 | 4.1 times |
+| D: 5% insert, latest | 42,073 | 9,001 | 4.7 times |
+| E: 95% short scans | 2,853 | 10,939 | **0.26 times** |
+| F: read-modify-write | 8,111 | 4,516 | 1.8 times |
+
+mvSQLite's numbers are its per-operation rows added up (A: read + update; F:
+read + read-modify-write). aozumi-db had no failures. Per operation on
+workload A, the p99 was 0.25 ms for reads and 21 ms for updates; mvSQLite
+published 40 ms and 77 ms.
+
+- **Faster on everything but scans.** Reads, updates and inserts are 1.8 to 5
+  times mvSQLite's throughput, with far shorter tails.
+- **Scans are about 4 times slower.** Workload E reads 1 to 100 rows per
+  operation, and aozumi-db encodes every row as libSQL's JSON. This is the
+  read path's known cost (see "The path apps use" above), and the next thing
+  to profile: protocol v3 (binary, cursors) and row encoding.
+- **mvSQLite does something aozumi-db does not:** every commit is replicated
+  across three machines, so it survives losing one. aozumi-db is one server
+  that flushes to its own disk, with backups shipped every 5 s. The two
+  setups also differ in their machines (one 8-vCPU server against five) and
+  in run length (60 s against 200 s).
+
+### Not compared
+
+- **rqlite** publishes only a range: about 10 to over 200 single-row inserts
+  a second on a 3-node Raft cluster, or about 220 in one blog test.
+- **Cloudflare D1, Turso Cloud and Neon** have no neutral published
+  benchmark. Their latency figures in blogs disagree with one another, and
+  depend on where the client is.
+- **SQLite's own TATP numbers** (*SQLite: Past, Present, and Future*, VLDB
+  2022) and its `speedtest1` cycle counts are published on vldb.org and
+  sqlite.org, which the machine that wrote this could not reach.
+
 ## Head-to-head on a dedicated machine: aozumi-db, libSQL's server and SQLite (2026-11-08)
 
 The first numbers here from a quiet, dedicated machine of the kind AOZUMI
