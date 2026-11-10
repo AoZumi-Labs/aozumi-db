@@ -385,8 +385,15 @@ async fn pipeline(state: &State, req: Request<Incoming>) -> Resp {
         },
         false => None,
     };
+    // With group commit, a request that only reads sees the last flushed
+    // commit and need not wait for a flush; anything else sees every commit.
+    let cap = match turn.is_none() && stream.reads_only(&msg.requests) {
+        true => db.durability.read_cap(),
+        false => None,
+    };
     // Statements block on disk and CPU, so they run on the blocking pool.
     let (stream, results, seen) = match tokio::task::spawn_blocking(move || {
+        stream.set_read_cap(cap);
         let results = msg.requests.iter().map(|request| stream.handle(request)).collect::<Vec<_>>();
         let seen = stream.seen();
         (stream, results, seen)
@@ -505,7 +512,12 @@ async fn console_run(state: &State, req: Request<Incoming>) -> Resp {
     };
     let started = Instant::now();
     let dry_run = body.dry_run;
+    let cap = match read_only {
+        true => db.durability.read_cap(),
+        false => None,
+    };
     let (stream, statements, seen) = match tokio::task::spawn_blocking(move || {
+        stream.set_read_cap(cap);
         let statements = match dry_run {
             true => stream.run_console_dry(split),
             false => Ok(stream.run_console(split)),
@@ -583,7 +595,9 @@ async fn console_read<T: Send + 'static>(
         .checkout(BUSY_TIMEOUT, true)
         .map_err(|err| text(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot connect: {err}")))?;
     let pool = db.pool.clone();
+    let cap = db.durability.read_cap();
     let (conn, result, seen) = tokio::task::spawn_blocking(move || {
+        conn.set_read_cap(cap);
         let result = read(&conn);
         let seen = conn.seen();
         (conn, result, seen)

@@ -47,3 +47,8 @@ debug = 0
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# turso_core 0.8.3 with readers capped at the last flushed commit (D33);
+# the patch is listed in vendor/turso_core/AOZUMI_PATCH.md.
+[patch.crates-io]
+turso_core = { path = "vendor/turso_core" }

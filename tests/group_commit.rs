@@ -88,3 +88,44 @@ async fn the_console_answers_after_its_writes() {
     assert_eq!(body["statements"][2]["rows"][0][0]["value"], "2");
     assert_eq!(count(&server, &token).await, 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_after_an_acknowledged_write_sees_it() {
+    let server = std::sync::Arc::new(group_server().await);
+    let token = server.database("app").await;
+    server.run(Some(&token), vec![execute("create table t (x)")]).await;
+    // Readers hammer the database while one client writes and reads back.
+    let readers = (0..4)
+        .map(|_| {
+            let (server, token) = (server.clone(), token.clone());
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    server.run(Some(&token), vec![execute("select count(*) from t")]).await;
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for n in 1..=50 {
+        server.run(Some(&token), vec![execute("insert into t values (1)")]).await;
+        assert_eq!(count(&server, &token).await, n, "a separate read request sees the acknowledged write");
+    }
+    for reader in readers {
+        reader.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_deferred_transaction_that_starts_by_reading_can_still_write() {
+    let server = group_server().await;
+    let token = server.database("app").await;
+    server.run(Some(&token), vec![execute("create table t (x)"), execute("insert into t values (1)")]).await;
+    let (status, body) = server.pipeline(Some(&token), json!({"baton": null, "requests": [execute("begin"), execute("select count(*) from t")]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let baton = body["baton"].clone();
+    let (status, body) = server
+        .pipeline(Some(&token), json!({"baton": baton, "requests": [execute("insert into t values (2)"), execute("commit"), {"type": "close"}]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["type"], "ok", "{body}");
+    assert_eq!(count(&server, &token).await, 2);
+}

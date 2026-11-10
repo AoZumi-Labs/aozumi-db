@@ -58,6 +58,35 @@ impl Stream {
         self.closed
     }
 
+    /// Whether `requests` only read, outside any transaction: then they can
+    /// read the last flushed commit instead of waiting for newer ones to be
+    /// flushed (group commit, D33). Errs toward no: a wrong no costs a wait
+    /// for a flush; a wrong yes, a write that fails on its stale snapshot.
+    pub fn reads_only(&self, requests: &[StreamRequest]) -> bool {
+        if self.in_transaction() {
+            return false;
+        }
+        if self.read_only {
+            return true;
+        }
+        let stmt_reads = |stmt: &Stmt| match (&stmt.sql, stmt.sql_id) {
+            (Some(sql), _) => sql_reads_only(sql),
+            (None, Some(id)) => self.sqls.get(&id).is_some_and(|sql| sql_reads_only(sql)),
+            (None, None) => true,
+        };
+        requests.iter().all(|request| match request {
+            StreamRequest::Execute { stmt } => stmt_reads(stmt),
+            StreamRequest::Batch { batch } => batch.steps.iter().all(|step| stmt_reads(&step.stmt)),
+            StreamRequest::Sequence { .. } => false,
+            _ => true,
+        })
+    }
+
+    /// Cap what the stream's connection reads (see `reads_only`).
+    pub fn set_read_cap(&self, cap: Option<std::sync::Arc<turso_core::ReadCap>>) {
+        self.conn.set_read_cap(cap);
+    }
+
     /// Whether running `requests` may write. Errs toward yes: a wrong yes
     /// costs a short wait in the writer queue, never correctness.
     pub fn may_write(&self, requests: &[StreamRequest]) -> bool {
@@ -282,6 +311,30 @@ fn sql_may_write(sql: &str) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether SQL is one statement that only reads and starts no transaction.
+fn sql_reads_only(sql: &str) -> bool {
+    let word = first_word(sql);
+    match word.as_str() {
+        "SELECT" | "VALUES" | "EXPLAIN" => !sql_may_write(sql),
+        "WITH" => !sql_may_write(sql),
+        _ => false,
+    }
+}
+
+fn first_word(sql: &str) -> String {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_ascii_uppercase()
 }
 
 /// Whether SQL may leave state on its connection: pragma settings and

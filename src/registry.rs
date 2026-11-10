@@ -602,6 +602,7 @@ impl Registry {
             let wal = PathBuf::from(format!("{}-wal", path.display()));
             let internal = ConnOptions { synchronous, ..Default::default() };
             let durability = Durability::new(synchronous == Synchronous::Group, db.clone(), wal, internal);
+            durability.start();
             Ok(OpenDb {
                 durability,
                 db,

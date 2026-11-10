@@ -10,6 +10,11 @@
 //! as what its connection read, and backups and copies flush the WAL before
 //! they read it. So what `full` promises still holds: nothing a client was
 //! told, and nothing in a backup, is lost on power loss.
+//!
+//! A request that only reads would then often wait for a flush. Instead it
+//! reads the database as of the last flushed commit (`ReadCap`, a patch to
+//! the engine in vendor/turso_core), which is on disk already. Writers and
+//! transactions read everything committed and wait as above.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -30,6 +35,9 @@ pub struct Durability {
     flushed: Notify,
     /// The flusher's own connection, to read how far the WAL is committed.
     probe: Mutex<Option<Conn>>,
+    /// The last flushed commit: requests that only read see the database as
+    /// of here (the engine patch in vendor/turso_core), so they never wait.
+    cap: Arc<turso_core::ReadCap>,
 }
 
 #[derive(Default)]
@@ -63,7 +71,28 @@ impl Durability {
             state: Mutex::default(),
             flushed: Notify::new(),
             probe: Mutex::new(None),
+            cap: Arc::new(turso_core::ReadCap::new()),
         })
+    }
+
+    /// Flush what a previous run of the server left unflushed, so readers
+    /// start from a cap that holds every commit on disk. Blocks.
+    pub fn start(&self) {
+        if !self.enabled {
+            return;
+        }
+        let position = self.flush();
+        let mut state = self.state.lock().unwrap();
+        state.in_flight = None;
+        if let Some(position) = position {
+            state.durable = Some(position);
+            self.cap.set(position.seq, position.frame);
+        }
+    }
+
+    /// The cap for connections that only read, with group commit on.
+    pub fn read_cap(&self) -> Option<Arc<turso_core::ReadCap>> {
+        self.enabled.then(|| self.cap.clone())
     }
 
     /// Wait until what a connection saw (`seen`, its WAL position after a
@@ -128,6 +157,7 @@ impl Durability {
                 if let Some(position) = position {
                     if state.durable.is_none_or(|durable| !covers(durable, position)) {
                         state.durable = Some(position);
+                        self.cap.set(position.seq, position.frame);
                     }
                 }
             }
@@ -220,6 +250,70 @@ mod tests {
         conn.execute_script("insert into t values (2)").unwrap();
         durability.wait(conn.seen()).await;
         assert_eq!(durability.state.lock().unwrap().completed, flushes + 1);
+    }
+
+    fn count(conn: &Conn) -> i64 {
+        match conn.execute("select count(*) from t", &[], &[], true).unwrap().rows[0][0] {
+            crate::proto::Value::Integer(n) => n,
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_reader_sees_only_flushed_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = crate::engine::open(&path).unwrap();
+        let options = ConnOptions { synchronous: crate::engine::Synchronous::Group, ..Default::default() };
+        let writer = Conn::open(&db, &options).unwrap();
+        writer.execute_script("create table t (x); insert into t values (1)").unwrap();
+        let durability = Durability::new(true, db.clone(), PathBuf::from(format!("{}-wal", path.display())), options.clone());
+        durability.start();
+
+        let reader = Conn::open(&db, &options).unwrap();
+        reader.set_read_cap(durability.read_cap());
+        assert_eq!(count(&reader), 1, "what was there at start is flushed");
+
+        writer.execute_script("insert into t values (2); insert into t values (3)").unwrap();
+        assert_eq!(count(&writer), 3, "the writer sees its own commits");
+        assert_eq!(count(&reader), 1, "a capped reader does not see unflushed commits");
+        let seen = reader.seen();
+        durability.wait(seen).await;
+        assert_eq!(durability.state.lock().unwrap().completed, 0, "a capped read waits for no flush");
+
+        durability.wait(writer.seen()).await;
+        assert_eq!(count(&reader), 3, "once flushed, they are seen");
+
+        // A capped connection cannot become a writer on a stale snapshot.
+        writer.execute_script("insert into t values (4)").unwrap();
+        assert!(reader.execute_script("insert into t values (5)").is_err());
+        reader.set_read_cap(None);
+        reader.execute_script("insert into t values (5)").unwrap();
+        assert_eq!(count(&writer), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_reader_stays_consistent_across_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = crate::engine::open(&path).unwrap();
+        let options = ConnOptions { synchronous: crate::engine::Synchronous::Group, ..Default::default() };
+        let writer = Conn::open(&db, &options).unwrap();
+        writer.execute_script("create table t (x)").unwrap();
+        let durability = Durability::new(true, db.clone(), PathBuf::from(format!("{}-wal", path.display())), options.clone());
+        durability.start();
+        let reader = Conn::open(&db, &options).unwrap();
+        reader.set_read_cap(durability.read_cap());
+        for round in 1..=3i64 {
+            writer.execute_script("insert into t values (1)").unwrap();
+            durability.wait(writer.seen()).await;
+            writer.checkpoint_truncate().unwrap();
+            writer.execute_script("insert into t values (1)").unwrap();
+            // The WAL restarted: the reader sees what the database file holds.
+            assert_eq!(count(&reader), round * 2 - 1, "round {round}");
+            durability.wait(writer.seen()).await;
+            assert_eq!(count(&reader), round * 2, "round {round}");
+        }
     }
 
     #[tokio::test]

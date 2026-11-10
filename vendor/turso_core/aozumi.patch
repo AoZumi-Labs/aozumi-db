@@ -1,0 +1,429 @@
+diff -ru '--exclude=benches' '--exclude=.cargo_vcs_info.json' '--exclude=target' '--exclude=AOZUMI_PATCH.md' '--exclude=aozumi.patch' a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ b/Cargo.toml	2026-11-09 22:55:35.516796461 +0000
+@@ -86,140 +86,31 @@
+ name = "turso_core"
+ path = "lib.rs"
+ 
+-[[bench]]
+-name = "alloc_collections"
+-path = "benches/alloc_collections.rs"
+-harness = false
+-
+-[[bench]]
+-name = "benchmark"
+-path = "benches/benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "checkpoint_n_rows"
+-path = "benches/checkpoint_n_rows.rs"
+-harness = false
+-
+-[[bench]]
+-name = "count_benchmark"
+-path = "benches/count_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "create_index_benchmark"
+-path = "benches/create_index_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "fts_benchmark"
+-path = "benches/fts_benchmark.rs"
+-harness = false
+-required-features = ["fts"]
+-
+-[[bench]]
+-name = "fts_comparison_benchmark"
+-path = "benches/fts_comparison_benchmark.rs"
+-harness = false
+-required-features = ["fts"]
+-
+-[[bench]]
+-name = "graph_queries_benchmark"
+-path = "benches/graph_queries_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "hash_spill_benchmark"
+-path = "benches/hash_spill_benchmark.rs"
+-harness = false
+-required-features = ["bench"]
+-
+-[[bench]]
+-name = "json_benchmark"
+-path = "benches/json_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "logical_log_serialization"
+-path = "benches/logical_log_serialization.rs"
+-harness = false
+-required-features = ["bench"]
+-
+-[[bench]]
+-name = "mvcc_benchmark"
+-path = "benches/mvcc_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "mvcc_recovery_benchmark"
+-path = "benches/mvcc_recovery_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "prepare_benchmark"
+-path = "benches/prepare_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "prepare_params_benchmark"
+-path = "benches/prepare_params_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "record_recycling"
+-path = "benches/record_recycling.rs"
+-harness = false
+-
+-[[bench]]
+-name = "scan_loop_benchmark"
+-path = "benches/scan_loop_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "select_star_benchmark"
+-path = "benches/select_star_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "sql_functions"
+-path = "benches/sql_functions/main.rs"
+-harness = false
+-required-features = ["bench"]
+-
+-[[bench]]
+-name = "string_expr_benchmark"
+-path = "benches/string_expr_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "struct_union_benchmark"
+-path = "benches/struct_union_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "struct_union_profile"
+-path = "benches/struct_union_profile.rs"
+-harness = false
+-
+-[[bench]]
+-name = "text_validate_benchmark"
+-path = "benches/text_validate_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "tpc_h_benchmark"
+-path = "benches/tpc_h_benchmark.rs"
+-harness = false
+-
+-[[bench]]
+-name = "triggers"
+-path = "benches/triggers.rs"
+-harness = false
+-
+-[[bench]]
+-name = "write_perf_benchmark"
+-path = "benches/write_perf_benchmark.rs"
+-harness = false
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+ 
+ [dependencies.aes]
+ version = "0.8.4"
+@@ -580,3 +471,10 @@
+     "cfg(antithesis)",
+     "cfg(nightly)",
+ ]
++
++# AOZUMI PATCH: upstream's own warnings, which crates.io builds cap.
++[lints.rust]
++unpredictable_function_pointer_comparisons = "allow"
++mismatched_lifetime_syntaxes = "allow"
++dead_code = "allow"
++incomplete_features = "allow"
+diff -ru '--exclude=benches' '--exclude=.cargo_vcs_info.json' '--exclude=target' '--exclude=AOZUMI_PATCH.md' '--exclude=aozumi.patch' a/connection.rs b/connection.rs
+--- a/connection.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/connection.rs	2026-11-09 22:40:15.692246682 +0000
+@@ -3941,6 +3941,14 @@
+         self.is_query_only()
+     }
+ 
++    /// AOZUMI PATCH: cap what this connection's later read transactions see
++    /// of the WAL (`None`: no cap). See [`crate::ReadCap`].
++    pub fn set_read_cap(&self, cap: Option<Arc<crate::ReadCap>>) {
++        if let Some(wal) = self.pager.load().wal.as_ref() {
++            wal.set_read_cap(cap);
++        }
++    }
++
+     pub fn set_query_only(&self, value: bool) {
+         self.query_only.store(value, Ordering::SeqCst);
+         self.bump_prepare_context_generation();
+diff -ru '--exclude=benches' '--exclude=.cargo_vcs_info.json' '--exclude=target' '--exclude=AOZUMI_PATCH.md' '--exclude=aozumi.patch' a/lib.rs b/lib.rs
+--- a/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/lib.rs	2026-11-09 22:51:32.468782014 +0000
+@@ -37,6 +37,7 @@
+ pub mod skiplist;
+ pub mod state_machine;
+ pub mod storage;
++pub use storage::wal::ReadCap;
+ pub mod types;
+ #[cfg(any(feature = "fuzz", feature = "bench"))]
+ pub mod vdbe;
+diff -ru '--exclude=benches' '--exclude=.cargo_vcs_info.json' '--exclude=target' '--exclude=AOZUMI_PATCH.md' '--exclude=aozumi.patch' a/storage/wal.rs b/storage/wal.rs
+--- a/storage/wal.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/storage/wal.rs	2026-11-09 22:40:03.948554726 +0000
+@@ -486,6 +486,49 @@
+     Writer,
+ }
+ 
++/// AOZUMI PATCH: a cap on the WAL frames a connection's read transactions
++/// see, shared by the connections of one database. The server sets it to
++/// the last commit it has flushed (`(checkpoint_seq, max_frame)`), so that
++/// readers never see a commit that is not on disk yet. A reader's snapshot
++/// is `min(shared max_frame, cap)`, never below the frames already
++/// checkpointed into the database file (those were flushed first). A cap
++/// from an older WAL generation means only the database file is known to
++/// be on disk. A capped connection cannot upgrade to a writer while frames
++/// past the cap exist: its snapshot is stale, and the upgrade fails with
++/// `BusySnapshot` as for any stale reader.
++#[derive(Debug, Default)]
++pub struct ReadCap(Mutex<Option<(u32, u64)>>);
++
++impl ReadCap {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Readers see the WAL up to `frame` of generation `checkpoint_seq`.
++    pub fn set(&self, checkpoint_seq: u32, frame: u64) {
++        *self.0.lock() = Some((checkpoint_seq, frame));
++    }
++
++    pub fn get(&self) -> Option<(u32, u64)> {
++        *self.0.lock()
++    }
++
++    /// The highest frame a reader may see, given the shared snapshot.
++    fn read_max(&self, snapshot: &WalSnapshot) -> u64 {
++        match self.get() {
++            // Nothing known to be on disk past the database file yet.
++            None => snapshot.nbackfills,
++            Some((seq, frame)) if seq == snapshot.checkpoint_seq => {
++                frame.clamp(snapshot.nbackfills, snapshot.max_frame)
++            }
++            Some((seq, _)) if seq < snapshot.checkpoint_seq => snapshot.nbackfills,
++            // A cap from a newer generation than this snapshot: stale
++            // snapshot, nothing to hold back.
++            Some(_) => snapshot.max_frame,
++        }
++    }
++}
++
+ /// Coordination operations that back the WAL's authoritative state.
+ trait WalCoordination: Debug + Send + Sync {
+     /// Load the current authoritative WAL snapshot.
+@@ -537,6 +580,14 @@
+     /// Try to acquire the reader protection needed for `snapshot`.
+     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind>;
+ 
++    /// AOZUMI PATCH: like `try_begin_read_tx`, for a reader that sees only
++    /// frames up to `read_max` of `snapshot` (`nbackfills <= read_max <=
++    /// max_frame`). Returns the guard and the frame the reader may see up
++    /// to: coordinations that cannot pin an older frame ignore the cap.
++    fn try_begin_read_tx_capped(&self, snapshot: WalSnapshot, _read_max: u64) -> Option<(ReadGuardKind, u64)> {
++        self.try_begin_read_tx(snapshot).map(|guard| (guard, snapshot.max_frame))
++    }
++
+     /// Release a read guard previously returned by `try_begin_read_tx`.
+     fn end_read_tx(&self, guard: ReadGuardKind);
+ 
+@@ -628,6 +679,10 @@
+     /// Begin a read transaction.
+     /// Returns whether the database state has changed since the last read transaction.
+     fn begin_read_tx(&self) -> Result<bool>;
++
++    /// AOZUMI PATCH: cap what this connection's later read transactions see
++    /// (`None`: no cap). See [`ReadCap`].
++    fn set_read_cap(&self, _cap: Option<Arc<ReadCap>>) {}
+     /// MVCC helper: check if WAL state changed without starting a read tx.
+     fn mvcc_refresh_if_db_changed(&self) -> bool;
+ 
+@@ -1025,10 +1080,18 @@
+     }
+ 
+     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
++        self.try_begin_read_tx_capped(snapshot, snapshot.max_frame).map(|(guard, _)| guard)
++    }
++
++    fn try_begin_read_tx_capped(&self, snapshot: WalSnapshot, read_max: u64) -> Option<(ReadGuardKind, u64)> {
+         turso_assert!(
+             snapshot.max_frame <= u32::MAX as u64,
+             "max_frame exceeds u32 read mark range"
+         );
++        turso_assert!(
++            snapshot.nbackfills <= read_max && read_max <= snapshot.max_frame,
++            "a capped reader must see the backfilled frames and no frame past max_frame"
++        );
+         // One read lock on the shared state for the whole slot selection.
+         // The read marks are atomics inside it, so taking the lock once
+         // instead of once per access changes nothing about their ordering,
+@@ -1049,7 +1112,7 @@
+                 read_locks[0].unlock();
+                 return None;
+             }
+-            return Some(ReadGuardKind::DbFile);
++            return Some((ReadGuardKind::DbFile, snapshot.max_frame));
+         }
+ 
+         let mut best_idx: i64 = -1;
+@@ -1061,7 +1124,7 @@
+             // in the tail of a RESTART/TRUNCATE checkpoint), and readers
+             // must share it rather than exhaust the slots.
+             if mark != READMARK_NOT_USED
+-                && mark <= snapshot.max_frame as u32
++                && mark <= read_max as u32
+                 && (best_idx == -1 || mark > best_mark)
+             {
+                 best_mark = mark;
+@@ -1069,14 +1132,14 @@
+             }
+         }
+ 
+-        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
++        if best_idx == -1 || (best_mark as u64) < read_max {
+             for (idx, read_lock) in read_locks.iter().enumerate().skip(1) {
+                 if !read_lock.write() {
+                     continue;
+                 }
+-                read_lock.set_value_exclusive(snapshot.max_frame as u32);
++                read_lock.set_value_exclusive(read_max as u32);
+                 best_idx = idx as i64;
+-                best_mark = snapshot.max_frame as u32;
++                best_mark = read_max as u32;
+                 read_lock.unlock();
+                 break;
+             }
+@@ -1093,9 +1156,12 @@
+             return None;
+         }
+ 
+-        Some(ReadGuardKind::ReadMark(
+-            NonZeroUsize::new(best_idx as usize)
+-                .expect("best_idx checked to be non-negative and non-zero"),
++        Some((
++            ReadGuardKind::ReadMark(
++                NonZeroUsize::new(best_idx as usize)
++                    .expect("best_idx checked to be non-negative and non-zero"),
++            ),
++            read_max,
+         ))
+     }
+ 
+@@ -2840,6 +2906,10 @@
+     /// reported durable under synchronous=FULL.
+     /// Shared with the fsync completion callback, hence the Arc.
+     dirty: Arc<AtomicBool>,
++
++    /// AOZUMI PATCH: when set, read transactions see the WAL only up to the
++    /// cap (see [`ReadCap`]).
++    read_cap: RwLock<Option<Arc<ReadCap>>>,
+ }
+ 
+ impl fmt::Debug for WalFile {
+@@ -3414,9 +3484,23 @@
+             };
+         }
+ 
++        // AOZUMI PATCH: a capped reader sees the WAL only up to its cap. Its
++        // snapshot differs from the shared one in max_frame, and carries no
++        // checksum or transaction count of its own: a capped connection never
++        // appends, and comparing snapshots still tells when what it reads
++        // changed (going back to an earlier frame counts as a change).
++        let read_max = match self.read_cap.read().as_ref() {
++            Some(cap) => cap.read_max(&shared_snapshot),
++            None => shared_snapshot.max_frame,
++        };
++        let read_snapshot = |read_max: u64| match read_max == shared_snapshot.max_frame {
++            true => shared_snapshot,
++            false => WalSnapshot { max_frame: read_max, last_checksum: (0, 0), transaction_count: 0, ..shared_snapshot },
++        };
++
+         // Check if database changed since this connection's last read transaction.
+         // If it has, the connection will invalidate its page cache.
+-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
++        let db_changed = self.db_changed_against(read_snapshot(read_max), self.connection_state());
+ 
+         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
+ 
+@@ -3430,11 +3514,12 @@
+             );
+         }
+ 
+-        let Some(read_guard) = self.coordination.try_begin_read_tx(shared_snapshot) else {
++        let Some((read_guard, read_max)) = self.coordination.try_begin_read_tx_capped(shared_snapshot, read_max) else {
+             return TryBeginReadResult::Retry;
+         };
++        let db_changed = db_changed || self.db_changed_against(read_snapshot(read_max), self.connection_state());
+         self.install_vacuum_lock_guard(vacuum_lock_guard);
+-        self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
++        self.install_connection_state(WalConnectionState::new(read_snapshot(read_max), read_guard));
+         tracing::debug!(
+             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
+             self.min_frame.load(Ordering::Acquire),
+@@ -3447,6 +3532,10 @@
+ }
+ 
+ impl Wal for WalFile {
++    fn set_read_cap(&self, cap: Option<Arc<ReadCap>>) {
++        *self.read_cap.write() = cap;
++    }
++
+     fn begin_read_tx(&self) -> Result<bool> {
+         // Implement progressive backoff because transient lock contention
+         // should resolve quickly, but under heavy contention busy-spinning wastes
+@@ -4855,6 +4944,7 @@
+             checkpoint_guard: RwLock::new(None),
+             io_ctx: RwLock::new(IOContext::default()),
+             dirty: Arc::new(AtomicBool::new(false)),
++            read_cap: RwLock::new(None),
+         }
+     }
+ 

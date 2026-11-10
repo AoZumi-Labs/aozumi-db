@@ -205,6 +205,12 @@ impl Conn {
         self.inner.execute(sql).map_err(|err| self.error(err))
     }
 
+    /// Cap what this connection's later reads see of the WAL (group commit:
+    /// the last flushed commit), or `None` to see everything committed.
+    pub fn set_read_cap(&self, cap: Option<Arc<turso_core::ReadCap>>) {
+        self.inner.set_read_cap(cap);
+    }
+
     /// How far into the WAL this connection's last read or commit saw.
     /// Starts no read. `None` if the engine cannot say.
     pub fn seen(&self) -> Option<WalPosition> {
