@@ -1,0 +1,4 @@
+server: 8 vCPU, Neoverse-V1
+AWS Graviton3 AWS Graviton3 CPU @ 2.6GHz, kernel 7.0.0-1014-aws, aozumi-db 0b31ddc
+/nvme: /dev/nvme1n1 ext4   rw,noatime
+/gp3: /dev/nvme2n1 ext4   rw,noatime

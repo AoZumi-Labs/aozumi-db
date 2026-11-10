@@ -222,6 +222,68 @@ per request on a kept-alive connection.
   At 15 times the requests a second it uses up its CPU share. The same
   probe with 2 vCPUs had a p99 of 3.3 ms and 6,802 reads a second.
 
+## Group commit (2026-11-10)
+
+`AOZUMI_DB_SYNCHRONOUS=group` (D33) against the default `full`, on the same
+machine and disks, both modes back to back in alternating order, two
+repeats each; the table shows their mean. A c7gd.2xlarge (8 Graviton3
+vCPUs), the client on the same machine over loopback HTTP, ext4 with
+`noatime`. aozumi-db `0b31ddc`. No run had a failed request. Raw output and
+the script: `bench/results/2026-11-10-group-commit/`.
+
+Both modes keep the same promise: no acknowledged commit is lost on power
+loss, and backups hold only flushed commits.
+
+### gp3, the kind of volume production uses
+
+A flush takes about 2.4 ms here, so `full` commits about 420 times a second
+whatever the load.
+
+| | `full` | `group` | |
+|---|---:|---:|---|
+| 100-row transactions/s, 1 connection | 317 | 317 | same |
+| 4 connections | 418 | 775 | 1.9 times |
+| 16 connections | 416 | 1,745 | 4.2 times |
+| 64 connections (p99.9) | 417 (173 ms) | 1,577 (82 ms) | 3.8 times |
+| YCSB A, 50% updates: ops/s | 1,023 | 8,763 | 8.6 times |
+| update p50 | 62 ms | 4.8 ms | |
+| read p50 / p99 | 0.13 / 0.20 ms | 0.21 / 0.52 ms | |
+| YCSB B, 5% updates: ops/s | 10,078 | 40,559 | 4.0 times |
+| read p50 | 0.12 ms | 0.59 ms | |
+| YCSB C, reads only: ops/s | 43,108 | 42,357 | same (repeats spread 6%) |
+
+### Local NVMe
+
+A flush is much shorter here: a whole 100-row transaction takes 1.06 ms at one connection, against 2.93 ms on gp3. The disk is rarely what writers wait for.
+
+| | `full` | `group` | |
+|---|---:|---:|---|
+| 100-row transactions/s, 1 connection | 801 | 803 | same |
+| 4 connections | 1,718 | 1,998 | +16% |
+| 16 connections | 1,738 | 1,693 | -3% |
+| 64 connections | 1,566 | 1,535 | -2% |
+| YCSB A: ops/s | 9,462 | 20,790 | 2.2 times |
+| read p50 | 0.14 ms | 0.19 ms | |
+| YCSB B: ops/s | 42,297 | 41,275 | -2% |
+| YCSB C: ops/s | 43,049 | 42,979 | same |
+
+### What it means
+
+- **Reads do not wait for flushes.** A request that only reads sees the last
+  flushed commit (the read cap). Read-only YCSB C is the same in both modes.
+  The higher read latencies in A and B come from the server doing 2 to 9
+  times more work in the same time, not from waiting. (An earlier version
+  without the read cap held each such read for a flush: on a cloud container's
+  disk that put the read p50 at about 1.45 ms and cost workload B 10%.)
+- **On gp3, writes are 2 to 9 times faster,** and the worst write latency at
+  64 connections halves.
+- **On NVMe, where the flush is short, it costs about 2%** at saturation (16
+  and 64 connections, workload B): both `group` repeats came in below both
+  `full` repeats. That is the cost of coordinating flushes when there is
+  little to gain from sharing them.
+- **One connection is the same in both:** with no one to share a flush with,
+  each commit still flushes on its own.
+
 ## Head-to-head on a dedicated machine: aozumi-db, libSQL's server and SQLite (2026-11-08)
 
 The first numbers here from a quiet, dedicated machine of the kind AOZUMI
