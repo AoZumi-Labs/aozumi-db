@@ -233,6 +233,10 @@ the script: `bench/results/2026-11-10-group-commit/`.
 
 ![Group commit against one flush per commit, on gp3 and local NVMe](bench/results/2026-11-10-group-commit/group-commit.png)
 
+Against other databases' published numbers, with group commit added:
+
+![aozumi-db against Turso, SQLite and mvSQLite's published numbers](bench/results/2026-11-10-group-commit/vs-published.png)
+
 Both modes keep the same promise: no acknowledged commit is lost on power
 loss, and backups hold only flushed commits.
 
