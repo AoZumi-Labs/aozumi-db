@@ -231,6 +231,8 @@ vCPUs), the client on the same machine over loopback HTTP, ext4 with
 `noatime`. aozumi-db `0b31ddc`. No run had a failed request. Raw output and
 the script: `bench/results/2026-11-10-group-commit/`.
 
+![Group commit against one flush per commit, on gp3 and local NVMe](bench/results/2026-11-10-group-commit/group-commit.png)
+
 Both modes keep the same promise: no acknowledged commit is lost on power
 loss, and backups hold only flushed commits.
 
